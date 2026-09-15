@@ -1,0 +1,44 @@
+{
+	email admin@example.com
+}
+
+app.example.com {
+	encode gzip zstd
+	reverse_proxy frontend:3000
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+api.example.com {
+	encode gzip zstd
+
+	# The member EA long-poll blocks server-side for up to 25s. Buffering it would
+	# defeat the point and make every poll look like a timeout.
+	@longpoll path /api/v1/ea/member/poll*
+	reverse_proxy @longpoll backend:8000 {
+		flush_interval -1
+		transport http {
+			read_timeout 60s
+		}
+	}
+
+	# WebSocket upgrade for the dashboard live feed.
+	@websocket {
+		header Connection *Upgrade*
+		header Upgrade websocket
+	}
+	reverse_proxy @websocket backend:8000
+
+	reverse_proxy backend:8000
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+}

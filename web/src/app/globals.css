@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Dark by default. An operations console is looked at for hours, often in a room
+ * with charts on the other screen; a bright page is the wrong default here.
+ */
+:root {
+  --bg: 222 18% 11%;
+  --bg-raised: 222 16% 14%;
+  --bg-sunken: 222 20% 8%;
+  --line: 222 12% 22%;
+  --fg: 210 20% 96%;
+  --fg-muted: 215 12% 65%;
+  --fg-subtle: 215 10% 48%;
+  --accent: 199 89% 55%;
+  --accent-fg: 222 20% 8%;
+  --long: 152 58% 48%;
+  --short: 0 72% 60%;
+  --warn: 38 92% 56%;
+  --danger: 0 78% 58%;
+}
+
+.light {
+  --bg: 210 20% 98%;
+  --bg-raised: 0 0% 100%;
+  --bg-sunken: 210 16% 94%;
+  --line: 214 18% 88%;
+  --fg: 222 25% 14%;
+  --fg-muted: 215 14% 40%;
+  --fg-subtle: 215 12% 55%;
+  --accent: 199 89% 42%;
+  --accent-fg: 0 0% 100%;
+  --long: 152 58% 36%;
+  --short: 0 68% 48%;
+  --warn: 32 88% 44%;
+  --danger: 0 72% 48%;
+}
+
+* { border-color: hsl(var(--line)); }
+
+body {
+  background-color: hsl(var(--bg));
+  color: hsl(var(--fg));
+  font-feature-settings: "cv02", "cv03", "cv04";
+}
+
+/* Numbers in tables must align vertically: a price column that jitters is
+   unreadable at a glance, which is the only way anyone reads it. */
+.tabular { font-variant-numeric: tabular-nums; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: hsl(var(--bg-sunken)); }
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--line));
+  border-radius: 5px;
+  border: 2px solid hsl(var(--bg-sunken));
+}
