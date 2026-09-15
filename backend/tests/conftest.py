@@ -54,5 +54,17 @@ async def _reset_redis_client() -> AsyncGenerator[None, None]:
     from app.core import redis as redis_module
 
     await redis_module.close_redis()
+    # Rate-limit counters and nonces are Redis state; leaking them between tests
+    # makes later tests fail for reasons that have nothing to do with their subject.
+    client = redis_module.get_redis()
+    await client.flushdb()
+
+    # Worker tasks use the module-level engine rather than the injected test session.
+    # Its pooled connections are bound to whichever event loop first used them, so
+    # they must be dropped between tests.
+    from app.core import db as db_module
+
+    await db_module.engine.dispose()
     yield
     await redis_module.close_redis()
+    await db_module.engine.dispose()
