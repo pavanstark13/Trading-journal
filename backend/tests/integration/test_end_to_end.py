@@ -25,12 +25,12 @@ from sqlalchemy import select
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from mt5.mocks.fake_ea import FakeEa  # noqa: E402
+from mt5.mocks.fake_ea import FakeEa
 
-from app.core import crypto  # noqa: E402
-from app.core.db import get_session  # noqa: E402
-from app.main import create_app  # noqa: E402
-from app.models import (  # noqa: E402
+from app.core import crypto
+from app.core.db import get_session
+from app.main import create_app
+from app.models import (
     CopyOrder,
     CopySettings,
     EaInstallation,
@@ -43,7 +43,7 @@ from app.models import (  # noqa: E402
     TradeEvent,
     User,
 )
-from app.workers import tasks  # noqa: E402
+from app.workers import tasks
 
 BOT_TOKEN = "123456789:AAFakeTokenForTestsOnly-abcdefghijklmno"
 TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -282,7 +282,7 @@ async def test_unsigned_and_tampered_requests_are_rejected(db, app_client) -> No
     import json as _json
 
     body = _json.dumps({"server": "x", "events": []}, separators=(",", ":")).encode()
-    headers = ea._sign(body)  # noqa: SLF001 - exercising the signing contract
+    headers = ea._sign(body)
     tampered = await app_client.post(
         "/api/v1/ea/master/events", content=body.replace(b'"x"', b'"y"'), headers=headers
     )
@@ -290,7 +290,7 @@ async def test_unsigned_and_tampered_requests_are_rejected(db, app_client) -> No
 
     # A correctly signed request succeeds once; replaying it verbatim is refused,
     # because the nonce has been consumed.
-    fresh_headers = ea._sign(body)  # noqa: SLF001
+    fresh_headers = ea._sign(body)
     signed_ok = await app_client.post(
         "/api/v1/ea/master/events", content=body, headers=fresh_headers
     )
