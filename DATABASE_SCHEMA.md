@@ -117,7 +117,7 @@ ea_installations (
   api_secret_hash    text NOT NULL,              -- Argon2id of the HMAC secret
   api_secret_enc     bytea,                      -- envelope-encrypted, for one-time re-reveal
   secret_version     integer NOT NULL DEFAULT 1,
-  previous_secret_hash text,                     -- accepted during a rotation grace window
+  previous_secret_enc  bytea,                     -- accepted during a rotation grace window
   rotation_expires_at  timestamptz,
   ea_version         text,
   terminal_build     integer,
