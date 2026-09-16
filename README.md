@@ -87,9 +87,11 @@ docker compose exec backend python -m app.cli create-master --mt5-login 5012345 
 Then: install the master EA ([`mt5/README.md`](mt5/README.md)), configure the Telegram
 channel and press **Test**, add members and issue their install codes.
 
-**Stay in PAPER mode for at least a week of real master trading.** In PAPER, copy orders
-are planned, risk-checked and recorded exactly as in LIVE, then filled by the simulator.
-Compare what it produced against what you wanted, then go live from `/settings`.
+The system starts **LIVE**. What gates real trading is not the mode but
+`copy_enabled`, which is **off for every new member** — so bring them on one at a time,
+smallest account first, and watch `/copy-orders` for the lot sizes and rejections after
+each one. `PAPER` remains available per member and system-wide if you ever want
+simulated fills instead.
 
 ### Local development
 
@@ -156,6 +158,9 @@ master account, and every live execution is auditable end to end.
 - No MT5 password is stored, requested, or transmitted. Anywhere. The EA authenticates
   itself; broker credentials never reach this system.
 - Members cannot widen their own risk limits — those are admin-write, member-read.
-- New members default to PAPER mode with copying disabled.
-- Going LIVE requires `SUPER_ADMIN`, recent re-authentication, and a typed confirmation.
+- New members are created with copying **disabled**; enabling each one is a deliberate act.
+- Changing the system mode requires `SUPER_ADMIN`, recent re-authentication, and a typed
+  confirmation.
+- Lot sizes come from each member's own broker contract specification, reported by their
+  terminal — never assumed.
 - The emergency stop halts new activity and deliberately does **not** close positions.

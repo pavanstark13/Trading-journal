@@ -38,6 +38,7 @@ datetime g_lastBeat  = 0;
 datetime g_lastOk    = 0;
 bool     g_halted    = false;
 int      g_failures  = 0;
+int      g_beatCount = 0;
 datetime g_nextPollAt = 0;
 
 #define TB_GV_LOCK "TradeBridge_Member_Lock_"
@@ -173,6 +174,7 @@ void Execute(const string instruction)
    double takeProfit= TB_JsonGetDouble(instruction, "take_profit");
    int    slippage  = (int)TB_JsonGetLong(instruction, "max_slippage_points", 20);
    int    maxSpread = (int)TB_JsonGetLong(instruction, "max_spread_points", 0);
+   long   brokerTicket = TB_JsonGetLong(instruction, "broker_ticket", 0);
 
    if(token == "") return;
 
@@ -234,17 +236,29 @@ void Execute(const string instruction)
            ? g_trade.Buy(lot, symbol, 0.0, stopLoss, takeProfit, clientTag)
            : g_trade.Sell(lot, symbol, 0.0, stopLoss, takeProfit, clientTag);
    }
-   else if(action == "CLOSE")
+   else if(action == "CLOSE" || action == "PARTIAL_CLOSE" || action == "MODIFY")
    {
-      ok = CloseTagged(symbol, clientTag, 0.0);
-   }
-   else if(action == "PARTIAL_CLOSE")
-   {
-      ok = CloseTagged(symbol, clientTag, NormalizeLot(symbol, lot));
-   }
-   else if(action == "MODIFY")
-   {
-      ok = ModifyTagged(symbol, stopLoss, takeProfit);
+      // The backend names the exact position this member holds for the master trade.
+      // Acting on "the first position on this symbol" closes the wrong one the moment
+      // a hedging account holds two.
+      if(brokerTicket <= 0 || !PositionSelectByTicket(brokerTicket))
+      {
+         Report(token, "SKIPPED", 0, 0, 0, 0,
+                "Position " + IntegerToString(brokerTicket) + " is not open here");
+         return;
+      }
+      if(action == "MODIFY")
+         ok = g_trade.PositionModify((ulong)brokerTicket, stopLoss, takeProfit);
+      else if(action == "PARTIAL_CLOSE")
+      {
+         double open = PositionGetDouble(POSITION_VOLUME);
+         double part = NormalizeLot(symbol, lot);
+         ok = (part > 0 && part < open)
+              ? g_trade.PositionClosePartial((ulong)brokerTicket, part)
+              : g_trade.PositionClose((ulong)brokerTicket);
+      }
+      else
+         ok = g_trade.PositionClose((ulong)brokerTicket);
    }
    else
    {
@@ -317,34 +331,74 @@ bool HasTag(const string clientTag)
 }
 
 //+------------------------------------------------------------------+
-bool CloseTagged(const string symbol, const string clientTag, const double volume)
+//| Today's realised profit on this account, from the terminal's own  |
+//| deal history. The backend cannot compute this -- it never sees    |
+//| the member's non-copied trades -- and max_daily_loss needs it.    |
+//+------------------------------------------------------------------+
+double RealisedProfitToday()
 {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-      if(PositionGetString(POSITION_SYMBOL) != symbol) continue;
+   MqlDateTime now;
+   TimeToStruct(TimeCurrent(), now);
+   now.hour = 0; now.min = 0; now.sec = 0;
+   datetime dayStart = StructToTime(now);
 
-      double open = PositionGetDouble(POSITION_VOLUME);
-      if(volume > 0 && volume < open)
-         return g_trade.PositionClosePartial(ticket, volume);
-      return g_trade.PositionClose(ticket);
+   if(!HistorySelect(dayStart, TimeCurrent())) return 0.0;
+
+   double total = 0.0;
+   int deals = HistoryDealsTotal();
+   for(int i = 0; i < deals; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT &&
+         entry != DEAL_ENTRY_OUT_BY) continue;
+      total += HistoryDealGetDouble(ticket, DEAL_PROFIT)
+             + HistoryDealGetDouble(ticket, DEAL_SWAP)
+             + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
    }
-   return false;
+   return total;
 }
 
 //+------------------------------------------------------------------+
-bool ModifyTagged(const string symbol, const double stopLoss, const double takeProfit)
+//| Contract specifications for everything in Market Watch.           |
+//| Volume step is not 0.01 everywhere: gold, indices and crypto      |
+//| commonly use 0.1 or 1.0, and tick value depends on the account    |
+//| currency. The backend must not guess either.                      |
+//+------------------------------------------------------------------+
+string BuildSymbolSpecs()
 {
-   bool any = false;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   string json = "[";
+   int total = SymbolsTotal(true);          // selected symbols only
+   int emitted = 0;
+
+   for(int i = 0; i < total && emitted < 200; i++)
    {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-      if(PositionGetString(POSITION_SYMBOL) != symbol) continue;
-      if(g_trade.PositionModify(ticket, stopLoss, takeProfit)) any = true;
+      string symbol = SymbolName(i, true);
+      if(symbol == "") continue;
+
+      double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+      if(step <= 0) continue;               // not a tradable contract
+
+      if(emitted > 0) json += ",";
+      json += "{";
+      json += TB_JsonStr("symbol", symbol) + ",";
+      json += TB_JsonNum("volume_min", SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN), 4) + ",";
+      json += TB_JsonNum("volume_max", SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX), 4) + ",";
+      json += TB_JsonNum("volume_step", step, 4) + ",";
+      json += TB_JsonNum("tick_value", SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE), 8) + ",";
+      json += TB_JsonNum("tick_size", SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE), 8) + ",";
+      json += TB_JsonNum("contract_size",
+                         SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE), 2) + ",";
+      json += TB_JsonInt("digits", SymbolInfoInteger(symbol, SYMBOL_DIGITS)) + ",";
+      json += TB_JsonBool("trade_allowed",
+                          SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE)
+                          != SYMBOL_TRADE_MODE_DISABLED);
+      json += "}";
+      emitted++;
    }
-   return any;
+   json += "]";
+   return json;
 }
 
 //+------------------------------------------------------------------+
@@ -387,6 +441,14 @@ void SendHeartbeat()
    body += TB_JsonNum("equity", AccountInfoDouble(ACCOUNT_EQUITY), 2) + ",";
    body += TB_JsonNum("free_margin", AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2) + ",";
    body += TB_JsonInt("open_positions", PositionsTotal()) + ",";
+   body += TB_JsonNum("realised_pl_today", RealisedProfitToday(), 2) + ",";
+
+   // Specifications change rarely; send them on the first beat and every 10th after,
+   // so the backend sizes lots from the real contract rather than an assumption.
+   if(g_beatCount % 10 == 0)
+      body += "\"symbol_specs\":" + BuildSymbolSpecs() + ",";
+   g_beatCount++;
+
    body += TB_JsonStr("ea_version", "1.00") + ",";
    body += TB_JsonInt("terminal_build", TerminalInfoInteger(TERMINAL_BUILD));
    body += "}";

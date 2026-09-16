@@ -36,7 +36,7 @@ from app.schemas.ea import (
     MemberPositionsIn,
     MemberResultIn,
 )
-from app.services import ingest
+from app.services import ingest, symbol_specs
 
 router = APIRouter(prefix="/ea", tags=["ea"])
 log = get_logger(__name__)
@@ -138,6 +138,15 @@ async def _heartbeat_impl(
             member.free_margin = payload.free_margin
             member.open_positions = payload.open_positions
             member.last_heartbeat_at = now
+            if payload.realised_pl_today is not None:
+                member.realised_pl_today = payload.realised_pl_today
+                member.realised_pl_date = now
+            if payload.symbol_specs:
+                await symbol_specs.upsert_many(
+                    db,
+                    member.id,
+                    [spec.model_dump(mode="json") for spec in payload.symbol_specs],
+                )
 
     install = await db.get(EaInstallation, principal.installation_id)
     if install:

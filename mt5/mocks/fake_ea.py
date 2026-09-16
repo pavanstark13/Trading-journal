@@ -71,6 +71,17 @@ class FakeEa:
     equity: float = 10000.0
     open_positions: list[dict[str, Any]] = field(default_factory=list)
     executed: list[dict[str, Any]] = field(default_factory=list)
+    realised_pl_today: float = 0.0
+    #: Contract specifications this terminal would report from its Market Watch.
+    symbol_specs: list[dict[str, Any]] = field(
+        default_factory=lambda: [
+            {
+                "symbol": "EURUSD", "volume_min": "0.01", "volume_max": "100",
+                "volume_step": "0.01", "tick_value": "1.0", "tick_size": "0.00001",
+                "digits": 5, "trade_allowed": True,
+            }
+        ]
+    )
 
     def _sign(self, body: bytes) -> dict[str, str]:
         timestamp = str(int(time.time()))
@@ -126,6 +137,8 @@ class FakeEa:
                 "equity": self.equity,
                 "free_margin": self.equity * 0.9,
                 "open_positions": len(self.open_positions),
+                "realised_pl_today": self.realised_pl_today,
+                "symbol_specs": self.symbol_specs if self.kind == "MEMBER" else [],
                 "ea_version": "mock-1.0",
                 "terminal_build": 4755,
             },

@@ -8,7 +8,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
-import pytest
 import respx
 from sqlalchemy import select
 
@@ -332,15 +331,21 @@ async def test_lease_expiry_marks_timed_out(db) -> None:
     assert orders[0].status == "TIMED_OUT"
 
 
-async def test_one_copy_order_per_member_per_event(db) -> None:
+async def test_replanning_is_idempotent_and_never_raises(db) -> None:
+    """A replayed outbox row must not raise.
+
+    If plan() raises on a duplicate, the relay resets dispatched_at and retries the
+    same row forever -- the outbox stalls and the whole pipeline stops.
+    """
     master, _, install = await _fixtures(db)
     await ingest.ingest_batch(db, master, EaEventBatch(events=[_event(master)]), install.id)
     event = (await db.execute(select(TradeEvent))).scalars().one()
 
-    await copy_planner.plan(db, event)
-    with pytest.raises(Exception):  # noqa: B017 - the unique constraint is the point
-        await copy_planner.plan(db, event)
-    await db.rollback()
+    first = await copy_planner.plan(db, event)
+    assert len(first) == 1
+
+    second = await copy_planner.plan(db, event)
+    assert second == []
 
     orders = (await db.execute(select(CopyOrder))).scalars().all()
     assert len(orders) == 1

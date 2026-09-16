@@ -69,8 +69,11 @@ Then, in the dashboard:
    (see [MT5_INTEGRATION §6](MT5_INTEGRATION.md#6-installation-what-the-docs-must-cover)).
 2. Configure the Telegram channel, press **Test** — a test message, never a fake trade.
 3. Create members, issue install codes, have them install the member EA.
-4. **Stay in PAPER mode for at least a week of real master trading.** Compare what the
-   simulator produced against what you would have wanted. Then go LIVE.
+4. **Before enabling copying for anyone**, run one live trade on the master with every
+   member still switched off, and confirm on `/trades` that it was ingested, published
+   to Telegram, and produced a copy order per member with the lot size you expect
+   (rejected with `COPY_DISABLED` is the correct outcome at this stage — the sizing is
+   still computed and visible). Then enable members one at a time, smallest first.
 
 ---
 
@@ -79,7 +82,7 @@ Then, in the dashboard:
 ```ini
 # ── core ───────────────────────────────────────────────────────────────────
 ENV=production
-MODE=PAPER                       # PAPER | LIVE  (runtime setting overrides this)
+DEFAULT_MODE=LIVE                # mode a fresh install seeds; runtime setting wins after
 API_BASE_URL=https://api.example.com
 FRONTEND_ORIGIN=https://app.example.com
 ENABLE_DOCS=false

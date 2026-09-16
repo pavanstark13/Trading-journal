@@ -196,7 +196,7 @@ function CreateMemberDialog({ open, onClose }: { open: boolean; onClose: () => v
       open={open}
       onClose={onClose}
       title="Add member"
-      description="New members start in PAPER mode with copying disabled. Both are deliberate."
+      description="Copying starts disabled for every new member. Enable it deliberately, once their terminal is connected and their risk limits are set."
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
@@ -224,8 +224,8 @@ function CreateMemberDialog({ open, onClose }: { open: boolean; onClose: () => v
         </Field>
         <Field label="Mode">
           <Select value={form.mode} onChange={set("mode")}>
-            <option value="PAPER">PAPER</option>
             <option value="LIVE">LIVE</option>
+            <option value="PAPER">PAPER (simulated fills)</option>
           </Select>
         </Field>
       </div>

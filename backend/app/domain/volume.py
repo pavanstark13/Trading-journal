@@ -192,6 +192,29 @@ def calculate_lot(inputs: SizingInputs) -> SizingResult:
     )
 
 
+def risk_for_lot(
+    lot: Decimal,
+    entry_price: Decimal | None,
+    stop_loss: Decimal | None,
+    spec: SymbolSpec,
+) -> Decimal | None:
+    """Money at risk if the stop is hit, in account currency.
+
+    Returns None when it cannot be computed (no stop, or no tick data for the symbol)
+    rather than guessing -- a fabricated risk number would silently satisfy a
+    max_trade_risk limit that was meant to block the trade.
+    """
+    if entry_price is None or stop_loss is None or stop_loss == ZERO:
+        return None
+    if spec.tick_value is None or spec.tick_size is None or spec.tick_size == ZERO:
+        return None
+    distance = abs(entry_price - stop_loss)
+    if distance == ZERO:
+        return ZERO
+    ticks = distance / spec.tick_size
+    return (ticks * spec.tick_value * lot).quantize(Decimal("0.01"), ROUND_HALF_UP)
+
+
 def scale_close_volume(
     master_closed: Decimal,
     master_total: Decimal,

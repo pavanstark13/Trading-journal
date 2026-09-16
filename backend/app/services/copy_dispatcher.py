@@ -76,6 +76,9 @@ async def dispatch(db: AsyncSession, order: CopyOrder) -> bool:
         "client_tag": client_tag(order.id),
         "expires_at": order.lease_expires_at.isoformat(),
         "reference_price": str(order.master_price) if order.master_price else None,
+        # Exits target the exact position this member holds, never "the first one on
+        # that symbol" -- which is wrong as soon as a hedging account holds two.
+        "broker_ticket": order.broker_ticket,
     }
 
     if order.is_paper or (system and system.mode == "PAPER"):

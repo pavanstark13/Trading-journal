@@ -59,10 +59,15 @@ export default function SettingsPage() {
         />
         <CardBody className="space-y-4">
           <p className="text-sm text-fg-muted">
-            In <strong>PAPER</strong> mode copy orders are planned, risk-checked and
-            recorded exactly as in LIVE, then filled by the simulator instead of a member
-            terminal. The whole timeline renders identically, so you can validate the
-            pipeline against real master trades before any money moves.
+            In <strong>LIVE</strong> mode copy orders reach real member terminals and
+            real brokers. In <strong>PAPER</strong> they are planned, risk-checked and
+            recorded identically, then filled by the simulator — useful for onboarding
+            one member without holding the others back.
+          </p>
+          <p className="text-sm text-fg-muted">
+            The mode is not what gates live trading. <strong>Copying is off for every
+            member until you enable it individually</strong>, so a LIVE system with
+            nobody enabled sends nothing.
           </p>
 
           {data.live_activated_at ? (
@@ -107,15 +112,23 @@ export default function SettingsPage() {
       </Card>
 
       <Card>
-        <CardHeader title="Going live: the checklist" />
+        <CardHeader title="Before you enable the first member" />
         <CardBody>
           <ol className="list-decimal space-y-1.5 pl-5 text-sm text-fg-muted">
-            <li>The master EA has been connected and reporting for at least a week.</li>
-            <li>Every member terminal shows ONLINE and has passed a PAPER fill.</li>
-            <li>Risk limits are set for every member — check the Risk page for rejections.</li>
+            <li>Master EA shows ONLINE and a real trade has appeared on the Trades page.</li>
+            <li>
+              Every member terminal shows ONLINE, and their contract specifications have
+              arrived — the Risk dry run says <code>broker</code>, not{" "}
+              <code>fallback</code>, as the spec source.
+            </li>
+            <li>Risk limits are set for every member, especially max lot and daily loss.</li>
             <li>The Telegram channel has received a test message.</li>
-            <li>A dry run on the Risk page produces the lot sizes you expect.</li>
+            <li>A dry run on the Risk page produces exactly the lot sizes you expect.</li>
             <li>You know where the emergency stop is, and who can clear it.</li>
+            <li>
+              Enable members <strong>one at a time, smallest account first</strong>, and
+              check Copy Orders after each live trade before enabling the next.
+            </li>
           </ol>
         </CardBody>
       </Card>

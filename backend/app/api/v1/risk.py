@@ -17,6 +17,7 @@ from app.core.security import UserPrincipal
 from app.domain import risk as risk_domain
 from app.domain import volume as volume_domain
 from app.models import CopyOrder, MemberAccount, SystemSettings
+from app.services import symbol_specs
 
 router = APIRouter(prefix="/risk", tags=["risk"])
 
@@ -126,6 +127,7 @@ async def simulate(
         if cs is None:
             continue
         symbol = str((cs.symbol_map or {}).get(payload.symbol, payload.symbol))
+        spec, spec_source = await symbol_specs.get_spec(db, member.id, symbol)
         entry: dict = {
             "member_account_id": str(member.id),
             "label": member.label,
@@ -141,7 +143,7 @@ async def simulate(
                     master_equity=(master.equity if master else None) or Decimal("0"),
                     member_balance=member.balance or Decimal("0"),
                     member_equity=member.equity or Decimal("0"),
-                    spec=volume_domain.SymbolSpec(symbol=symbol),
+                    spec=spec,
                     entry_price=payload.price,
                     stop_loss=payload.stop_loss,
                     fixed_lot=cs.fixed_lot,
@@ -152,12 +154,17 @@ async def simulate(
             )
             entry["calculated_lot"] = str(sizing.calculated_lot)
             entry["final_lot"] = str(sizing.final_lot)
-            entry["sizing_detail"] = sizing.detail
+            entry["sizing_detail"] = {**sizing.detail, "spec_source": spec_source}
+            entry["spec_source"] = spec_source
             lot = sizing.final_lot
+            trade_risk = volume_domain.risk_for_lot(
+                sizing.final_lot, payload.price, payload.stop_loss, spec
+            )
         except volume_domain.SizingError as exc:
             entry["would_copy"] = False
             entry["reason"] = exc.code
             entry["detail"] = str(exc)
+            entry["spec_source"] = spec_source
             results.append(entry)
             continue
 
@@ -183,7 +190,7 @@ async def simulate(
             signal=risk_domain.SignalContext(
                 symbol=symbol,
                 lot=lot,
-                trade_risk_money=None,
+                trade_risk_money=trade_risk,
                 signal_age_sec=0,
                 max_signal_age_sec=cs.max_signal_age_sec,
             ),

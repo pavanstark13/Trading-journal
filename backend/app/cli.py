@@ -42,10 +42,15 @@ async def create_superadmin(email: str) -> int:
                 )
             )
         if await db.get(SystemSettings, 1) is None:
-            # New installs start in PAPER. Going LIVE is a deliberate, audited action.
-            db.add(SystemSettings(id=1, mode="PAPER", copying_paused=False))
+            db.add(SystemSettings(id=1, mode=settings.default_mode, copying_paused=False))
         await db.commit()
     print(f"Super admin ready: {email}")
+    print(f"System mode: {settings.default_mode}")
+    if settings.default_mode == "LIVE":
+        print(
+            "Copying is still OFF for every member until you enable it individually "
+            "on their member page. That switch is the real gate."
+        )
     return 0
 
 

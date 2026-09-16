@@ -85,13 +85,15 @@ member_accounts (
   broker_server     text NOT NULL,
   currency          char(3) NOT NULL DEFAULT 'USD',
   leverage          integer,
-  mode              text NOT NULL DEFAULT 'PAPER',    -- PAPER | LIVE
+  mode              text NOT NULL DEFAULT 'LIVE',     -- PAPER | LIVE
   status            text NOT NULL DEFAULT 'ACTIVE',   -- ACTIVE | SUSPENDED | REVOKED
   -- live telemetry
   balance           numeric(18,2),
   equity            numeric(18,2),
   free_margin       numeric(18,2),
   open_positions    integer,
+  realised_pl_today numeric(18,2),        -- reported by the member's own terminal
+  realised_pl_date  timestamptz,          -- the day that figure belongs to
   last_heartbeat_at timestamptz,
   created_at        timestamptz NOT NULL DEFAULT now(),
   UNIQUE (mt5_login, broker_server)
@@ -311,6 +313,7 @@ copy_orders (
   id                 uuid PRIMARY KEY,
   trade_event_id     uuid NOT NULL REFERENCES trade_events ON DELETE CASCADE,
   master_trade_id    uuid REFERENCES master_trades,
+  master_position_id bigint,                      -- ★ links an exit to its own entry
   member_account_id  uuid NOT NULL REFERENCES member_accounts ON DELETE CASCADE,
   action             text NOT NULL,              -- OPEN|MODIFY|CLOSE|PARTIAL_CLOSE
                                                  -- |PLACE_PENDING|MODIFY_PENDING|CANCEL_PENDING
@@ -345,6 +348,28 @@ CREATE INDEX ON copy_orders (member_account_id, created_at DESC);
 CREATE INDEX ON copy_orders (status) WHERE status IN ('PENDING','SENT');
 CREATE INDEX ON copy_orders (execution_token);
 CREATE INDEX ON copy_orders (lease_expires_at) WHERE status = 'SENT';
+CREATE INDEX ON copy_orders (member_account_id, master_position_id);
+
+-- ─── broker contract specifications, per member ──────────────────────────────
+-- Reported by each member's own terminal, never assumed. Volume step is not 0.01
+-- everywhere (gold, indices and crypto commonly use 0.1 or 1.0) and tick value
+-- depends on the account currency; guessing either is a live-money bug, and
+-- risk-based sizing cannot be computed at all without tick value and tick size.
+symbol_specs (
+  id                 uuid PRIMARY KEY,
+  member_account_id  uuid NOT NULL REFERENCES member_accounts ON DELETE CASCADE,
+  symbol             text NOT NULL,
+  volume_min         numeric(12,4) NOT NULL,
+  volume_max         numeric(12,4) NOT NULL,
+  volume_step        numeric(12,4) NOT NULL,
+  tick_value         numeric(18,8),
+  tick_size          numeric(18,8),
+  contract_size      numeric(18,2),
+  digits             smallint NOT NULL DEFAULT 5,
+  trade_allowed      boolean NOT NULL DEFAULT true,
+  updated_at         timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (member_account_id, symbol)
+);
 ```
 
 ---
@@ -409,7 +434,7 @@ system_health (                                  -- latest sample per component
 
 system_settings (                                -- single row, id = 1
   id                  smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-  mode                text NOT NULL DEFAULT 'PAPER',   -- PAPER | LIVE
+  mode                text NOT NULL DEFAULT 'LIVE',    -- PAPER | LIVE
   copying_paused      boolean NOT NULL DEFAULT false,
   emergency_stop      boolean NOT NULL DEFAULT false,
   emergency_stop_at   timestamptz,

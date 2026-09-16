@@ -96,6 +96,7 @@ function Simulator() {
                   <Th>Member</Th>
                   <Th>Mode</Th>
                   <Th>Symbol</Th>
+                  <Th>Specs</Th>
                   <Th className="text-right">Calculated</Th>
                   <Th className="text-right">Final lot</Th>
                   <Th>Outcome</Th>
@@ -108,6 +109,11 @@ function Simulator() {
                     <Td className="font-medium">{member.label}</Td>
                     <Td><Badge tone={member.mode === "LIVE" ? "good" : "info"}>{member.mode}</Badge></Td>
                     <Td>{member.symbol}</Td>
+                    <Td>
+                      <Badge tone={member.spec_source === "broker" ? "good" : "warn"}>
+                        {member.spec_source === "broker" ? "broker" : "assumed"}
+                      </Badge>
+                    </Td>
                     <Td className="tabular text-right text-fg-muted">
                       {num(member.calculated_lot)}
                     </Td>

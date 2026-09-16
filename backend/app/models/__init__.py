@@ -120,12 +120,14 @@ class MemberAccount(Base):
     broker_server: Mapped[str] = mapped_column(String(120))
     currency: Mapped[str] = mapped_column(String(3), default="USD")
     leverage: Mapped[int | None] = mapped_column(Integer)
-    mode: Mapped[str] = mapped_column(String(10), default="PAPER")
+    mode: Mapped[str] = mapped_column(String(10), default="LIVE")
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE", index=True)
     balance: Mapped[Decimal | None] = mapped_column(Money)
     equity: Mapped[Decimal | None] = mapped_column(Money)
     free_margin: Mapped[Decimal | None] = mapped_column(Money)
     open_positions: Mapped[int | None] = mapped_column(Integer)
+    realised_pl_today: Mapped[Decimal | None] = mapped_column(Money)
+    realised_pl_date: Mapped[datetime | None] = mapped_column(TS)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(TS)
     created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
@@ -351,6 +353,7 @@ class CopyOrder(Base):
         Index("ix_copy_member_time", "member_account_id", "created_at"),
         Index("ix_copy_status", "status"),
         Index("ix_copy_lease", "lease_expires_at"),
+        Index("ix_copy_member_position", "member_account_id", "master_position_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
@@ -358,6 +361,7 @@ class CopyOrder(Base):
         ForeignKey("trade_events.id", ondelete="CASCADE")
     )
     master_trade_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("master_trades.id"))
+    master_position_id: Mapped[int | None] = mapped_column(BigInteger)
     member_account_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("member_accounts.id", ondelete="CASCADE")
     )
@@ -386,6 +390,35 @@ class CopyOrder(Base):
     dispatched_at: Mapped[datetime | None] = mapped_column(TS)
     executed_at: Mapped[datetime | None] = mapped_column(TS)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
+
+
+class SymbolSpec(Base):
+    """Broker contract specification, as reported by a member's own terminal.
+
+    Volume step is NOT 0.01 everywhere: XAUUSD, indices and crypto routinely use 0.1 or
+    1.0, and tick value differs per account currency. Guessing these is a live-money
+    bug, and risk-based sizing cannot be computed at all without tick value/size.
+    """
+
+    __tablename__ = "symbol_specs"
+    __table_args__ = (
+        UniqueConstraint("member_account_id", "symbol", name="uq_symbol_spec"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    member_account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("member_accounts.id", ondelete="CASCADE"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(32))
+    volume_min: Mapped[Decimal] = mapped_column(Volume)
+    volume_max: Mapped[Decimal] = mapped_column(Volume)
+    volume_step: Mapped[Decimal] = mapped_column(Volume)
+    tick_value: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    tick_size: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    contract_size: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    digits: Mapped[int] = mapped_column(SmallInteger, default=5)
+    trade_allowed: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(TS, server_default=func.now(), onupdate=_now)
 
 
 # ── operations ──────────────────────────────────────────────────────────────────
@@ -471,7 +504,7 @@ class SystemSettings(Base):
     __table_args__ = (CheckConstraint("id = 1", name="ck_single_row"),)
 
     id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, default=1)
-    mode: Mapped[str] = mapped_column(String(10), default="PAPER")
+    mode: Mapped[str] = mapped_column(String(10), default="LIVE")
     copying_paused: Mapped[bool] = mapped_column(Boolean, default=False)
     emergency_stop: Mapped[bool] = mapped_column(Boolean, default=False)
     emergency_stop_at: Mapped[datetime | None] = mapped_column(TS)
@@ -483,8 +516,24 @@ class SystemSettings(Base):
 
 
 __all__ = [
-    "AuditLog", "CopyOrder", "CopySettings", "DeadLetterEvent", "EaInstallation",
-    "ExecutionLog", "MasterAccount", "MasterTrade", "MemberAccount", "Notification",
-    "Outbox", "RiskSettings", "Session", "SystemHealth", "SystemSettings",
-    "TelegramChannel", "TelegramMessage", "TradeEvent", "User",
+    "AuditLog",
+    "CopyOrder",
+    "CopySettings",
+    "DeadLetterEvent",
+    "EaInstallation",
+    "ExecutionLog",
+    "MasterAccount",
+    "MasterTrade",
+    "MemberAccount",
+    "Notification",
+    "Outbox",
+    "RiskSettings",
+    "Session",
+    "SymbolSpec",
+    "SystemHealth",
+    "SystemSettings",
+    "TelegramChannel",
+    "TelegramMessage",
+    "TradeEvent",
+    "User",
 ]

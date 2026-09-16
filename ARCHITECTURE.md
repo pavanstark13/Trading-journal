@@ -229,16 +229,21 @@ Rules that keep later extraction cheap:
 ## 9. Operating modes
 
 `system_settings.mode ∈ {PAPER, LIVE}`, and every `member_accounts.mode` likewise.
+**A fresh installation starts in LIVE** (`DEFAULT_MODE`, overridable in `.env`).
 
-- **PAPER** — copy orders are planned, risk-checked, and recorded exactly as in LIVE, but
-  `copy_dispatcher` routes to the simulator instead of a member EA. Fill price = master
-  price + configured synthetic slippage. The entire timeline renders identically.
-- **LIVE** — requires an explicit `SUPER_ADMIN` action with a typed confirmation, which
-  writes an audit record. A member in `PAPER` inside a `LIVE` system is legal and is the
-  correct way to onboard someone.
+- **LIVE** — copy orders reach real member terminals and real brokers.
+- **PAPER** — copy orders are planned, risk-checked and recorded exactly as in LIVE, then
+  filled by the simulator instead of a member EA. The entire timeline renders
+  identically. A member in `PAPER` inside a `LIVE` system is legal, and is a useful way
+  to onboard one person without holding everyone else back.
 
 The mode is checked at exactly **one** place — `copy_dispatcher.dispatch()` — so it
 cannot be bypassed by a new code path.
+
+**What actually gates live trading is not the mode.** It is `copy_settings.copy_enabled`,
+which is **off for every new member**. Creating a member never enrols them into
+receiving trades; an admin turns each one on deliberately. That ordering is what makes a
+LIVE default safe: the system is live, but nobody is wired to it until you say so.
 
 ---
 

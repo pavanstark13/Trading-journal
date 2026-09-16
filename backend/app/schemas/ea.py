@@ -79,12 +79,34 @@ class EaRegisterOut(BaseModel):
     kind: str
 
 
+class EaSymbolSpec(BaseModel):
+    """Broker contract specification, straight from the member's own terminal."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    symbol: str = Field(max_length=32)
+    volume_min: Decimal = Decimal("0.01")
+    volume_max: Decimal = Decimal("100")
+    volume_step: Decimal = Decimal("0.01")
+    tick_value: Decimal | None = None
+    tick_size: Decimal | None = None
+    contract_size: Decimal | None = None
+    digits: int = 5
+    trade_allowed: bool = True
+
+
 class EaHeartbeatIn(BaseModel):
     balance: Decimal | None = None
     equity: Decimal | None = None
     margin: Decimal | None = None
     free_margin: Decimal | None = None
     open_positions: int | None = None
+    #: Today's realised profit and loss on this account, computed by the terminal from
+    #: its own deal history. Without it max_daily_loss can never fire.
+    realised_pl_today: Decimal | None = None
+    #: Contract specifications, sent on registration and periodically. Capped so a
+    #: large Market Watch cannot turn a heartbeat into a bulk upload.
+    symbol_specs: list[EaSymbolSpec] = Field(default_factory=list, max_length=200)
     ea_version: str | None = None
     terminal_build: int | None = None
 

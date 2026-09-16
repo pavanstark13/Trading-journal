@@ -41,7 +41,7 @@ class MemberCreateIn(BaseModel):
     mt5_login: int
     broker_server: str = Field(max_length=120)
     currency: str = Field(default="USD", max_length=3)
-    mode: str = Field(default="PAPER", pattern="^(PAPER|LIVE)$")
+    mode: str = Field(default="LIVE", pattern="^(PAPER|LIVE)$")
     initial_password: str = Field(min_length=12, max_length=256)
 
 
@@ -154,7 +154,8 @@ async def create_member(
     db.add(member)
     await db.flush()
 
-    # Safe defaults: copying OFF, PAPER mode. Nobody is auto-enrolled into live trading.
+    # Copying starts OFF regardless of mode: nobody is auto-enrolled into receiving
+    # trades just by being created.
     db.add(CopySettings(member_account_id=member.id, copy_enabled=False))
     db.add(RiskSettings(member_account_id=member.id, max_slippage_points=20))
 

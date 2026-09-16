@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     member_heartbeat_timeout_sec: int = 90
     master_heartbeat_timeout_sec: int = 120
 
+    # ── trading mode ────────────────────────────────────────────────────────
+    #: Mode a fresh installation starts in. LIVE by default; the per-member
+    #: copy_enabled flag (off by default) remains the gate that decides whether
+    #: anyone actually receives a trade.
+    default_mode: Literal["PAPER", "LIVE"] = "LIVE"
+
     # ── copy engine ─────────────────────────────────────────────────────────
     default_max_signal_age_sec: int = 60
     copy_lease_ttl_sec: int = 45

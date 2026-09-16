@@ -209,6 +209,8 @@ export interface SimulationResult {
     symbol: string;
     calculated_lot?: string;
     final_lot?: string;
+    /** "broker" when the member's terminal reported real contract specs, else "fallback". */
+    spec_source?: string;
     would_copy?: boolean;
     reason?: string | null;
     detail?: string | null;
