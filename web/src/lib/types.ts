@@ -1,10 +1,6 @@
-/** Shapes returned by the backend. Money and prices are strings by design. */
+/** Shapes the backend returns. Money and prices are strings so nothing rounds. */
 
-export type Role = "SUPER_ADMIN" | "ADMIN" | "MEMBER";
-export type Health = "ONLINE" | "WARNING" | "OFFLINE" | "UNKNOWN";
-export type CopyStatus =
-  | "PENDING" | "SENT" | "EXECUTED" | "FAILED"
-  | "REJECTED" | "CANCELLED" | "TIMED_OUT";
+export type Role = "ADMIN" | "MEMBER";
 
 export interface User {
   id: string;
@@ -22,205 +18,174 @@ export interface LoginResponse {
   user: User;
 }
 
-export interface DashboardData {
-  system: { mode: "PAPER" | "LIVE"; copying_paused: boolean; emergency_stop: boolean };
-  health: Record<string, Health>;
-  master: {
-    id: string;
-    label: string;
-    balance: string | null;
-    equity: string | null;
-    open_positions: number | null;
-    last_heartbeat_at: string | null;
-  } | null;
-  counts: {
-    members: number;
-    members_connected: number;
-    trades_today: number;
-    copies_successful: number;
-    copies_failed: number;
-    copies_rejected: number;
-    dead_letters: number;
-  };
-  recent_events: TradeEventRow[];
-}
-
-export interface TradeEventRow {
-  id: string;
-  event_id?: string;
-  event_type: string;
-  symbol: string | null;
-  side: string | null;
-  volume: string | null;
-  price: string | null;
-  stop_loss?: string | null;
-  take_profit?: string | null;
-  processing_status: string;
-  ignore_reason?: string | null;
-  occurred_at: string;
-  received_at?: string;
-  telegram_status?: string;
-  copy_summary?: { total: number; executed: number; failed: number; rejected: number };
-}
-
-export interface TimelineEntry {
-  stage: string;
-  status: "OK" | "RETRY" | "FAIL";
-  message: string | null;
-  meta: Record<string, unknown> | null;
-  at: string;
-  copy_order_id: string | null;
-}
-
-export interface CopyOrderRow {
-  id: string;
-  trade_event_id: string;
-  member_account_id: string;
-  action: string;
-  symbol: string;
-  side: string | null;
-  requested_lot: string;
-  calculated_lot: string;
-  final_lot: string;
-  sizing_mode: string | null;
-  status: CopyStatus;
-  master_price: string | null;
-  execution_price: string | null;
-  slippage_points: string | null;
-  broker_ticket: number | null;
-  broker_retcode: number | null;
-  reject_reason: string | null;
-  reject_detail: string | null;
-  latency_ms: number | null;
-  is_paper: boolean;
-  created_at: string;
-  executed_at: string | null;
-}
-
-export interface MemberRow {
+export interface AccountRow {
   id: string;
   label: string;
-  email: string | null;
+  broker_name: string | null;
   mt5_login: number;
   broker_server: string;
   currency: string;
-  mode: "PAPER" | "LIVE";
-  status: string;
+  margin_mode: "hedging" | "netting";
+  starting_balance: string | null;
   balance: string | null;
   equity: string | null;
   open_positions: number | null;
   last_heartbeat_at: string | null;
-  ea_online: boolean;
-  copy_enabled: boolean;
-  sizing_mode: string | null;
-}
-
-export interface MasterAccountRow {
-  id: string;
-  label: string;
-  mt5_login: number;
-  broker_server: string;
-  currency: string;
-  leverage?: number | null;
-  margin_mode: string;
-  balance: string | null;
-  equity: string | null;
-  margin: string | null;
-  free_margin: string | null;
-  open_positions: number | null;
-  connection: Health;
-  last_heartbeat_at: string | null;
-  publish_enabled: boolean;
-  copy_enabled: boolean;
-  magic_filter: number[] | null;
-  symbol_filter: string[] | null;
-  ea?: {
+  connected: boolean;
+  sync_status: string;
+  sync_error: string | null;
+  deal_count: number;
+  trade_count: number;
+  is_archived: boolean;
+  ea: {
     installation_id: string;
     status: string;
     ea_version: string | null;
     terminal_build: number | null;
     last_seen_at: string | null;
+    awaiting_setup: boolean;
   } | null;
-  last_event?: { event_type: string; symbol: string; occurred_at: string } | null;
 }
 
-export interface TelegramChannelRow {
+export interface TradeRow {
   id: string;
-  label: string;
-  chat_id: string;
-  is_enabled: boolean;
-  publish_types: string[];
-  display_timezone: string;
-  edit_in_place: boolean;
-  last_ok_at: string | null;
-  last_error: string | null;
-  has_token: boolean;
+  account_id: string;
+  trade_key: string;
+  symbol: string;
+  direction: "long" | "short";
+  status: "open" | "closed";
+  opened_at: string;
+  closed_at: string | null;
+  volume_opened: string;
+  volume_closed: string;
+  avg_entry_price: string | null;
+  avg_exit_price: string | null;
+  initial_sl: string | null;
+  initial_tp: string | null;
+  gross_profit: string;
+  commission: string;
+  swap: string;
+  net_profit: string;
+  risk_amount: string | null;
+  r_multiple: string | null;
+  pips: string | null;
+  duration_seconds: number | null;
+  exit_reason: string | null;
+  session: string | null;
+  hour_of_day: number | null;
+  day_of_week: number | null;
+  trade_date: string | null;
+  pl_provisional: boolean;
+  has_journal?: boolean;
+  tags?: string[];
 }
 
-export interface EaInstallationRow {
+export interface JournalData {
+  thesis: string | null;
+  execution_notes: string | null;
+  lesson: string | null;
+  emotion: string | null;
+  confidence: number | null;
+  followed_plan: boolean | null;
+  mistakes: string[];
+  grade: string | null;
+  setup_id: string | null;
+  setup_name: string | null;
+  updated_at: string;
+}
+
+export interface TradeDetail extends TradeRow {
+  account_label: string;
+  currency: string;
+  legs: {
+    seq: number;
+    type: "entry" | "exit";
+    deal_ticket: number;
+    volume: string;
+    price: string;
+    time_msc: number;
+  }[];
+  journal: JournalData | null;
+  screenshots: { id: string; kind: string; timeframe: string | null; caption: string | null }[];
+}
+
+export interface Summary {
+  trades: number;
+  wins: number;
+  losses: number;
+  scratches: number;
+  win_rate: string | null;
+  net_profit: string;
+  gross_win: string;
+  gross_loss: string;
+  profit_factor: string | null;
+  expectancy_r: string | null;
+  avg_r: string | null;
+  avg_win: string | null;
+  avg_loss: string | null;
+  largest_win: string | null;
+  largest_loss: string | null;
+  max_drawdown: string;
+  max_drawdown_pct: string | null;
+  longest_win_streak: number;
+  longest_loss_streak: number;
+  trades_without_stop: number;
+  avg_duration_seconds: number | null;
+  sqn: string | null;
+  /** True when there are too few trades for any of this to mean much. */
+  low_confidence: boolean;
+  sample_size: number;
+  min_meaningful_sample: number;
+}
+
+export interface Bucket {
+  key: string;
+  trades: number;
+  net_profit: string;
+  win_rate: string | null;
+  expectancy_r: string | null;
+  low_confidence: boolean;
+}
+
+export interface BucketStats {
+  trades: number;
+  net_profit: string;
+  win_rate: string | null;
+  expectancy_r: string | null;
+  low_confidence: boolean;
+}
+
+export interface Behaviour {
+  after_a_loss: { after_loss: BucketStats; otherwise: BucketStats };
+  plan_adherence: {
+    followed: BucketStats;
+    deviated: BucketStats;
+    unjournalled: number;
+  };
+}
+
+export interface Overview {
+  summary: Summary;
+  by_symbol: Bucket[];
+  by_hour: Bucket[];
+  by_weekday: Bucket[];
+  curves: {
+    equity: { at: string; equity: string; drawdown: string; net_profit: string; trade_key: string }[];
+    daily: { date: string; trades: number; net_profit: string; wins: number; losses: number }[];
+  };
+  behaviour: Behaviour;
+}
+
+export interface Setup {
   id: string;
-  kind: "MASTER" | "MEMBER";
-  status: string;
-  connection: Health;
-  master_account_id: string | null;
-  member_account_id: string | null;
-  ea_version: string | null;
-  terminal_build: number | null;
-  last_seen_at: string | null;
-  last_seen_ip: string | null;
-  pending_install_code: boolean;
+  name: string;
+  description: string | null;
+  checklist: string[];
+  color: string | null;
 }
 
-export interface AuditRow {
-  id: number;
-  actor_user_id: string | null;
-  actor_type: string;
-  action: string;
-  entity_type: string | null;
-  entity_id: string | null;
-  before: Record<string, unknown> | null;
-  after: Record<string, unknown> | null;
-  ip: string | null;
-  at: string;
-}
-
-export interface RejectionSummary {
-  window_hours: number;
-  total: number;
-  by_reason: { reason: string; count: number }[];
-  by_member: { member_account_id: string; count: number }[];
-  recent: {
-    id: string;
-    member_account_id: string;
-    symbol: string;
-    reason: string;
-    detail: string;
-    created_at: string;
-  }[];
-}
-
-export interface SimulationResult {
-  signal: Record<string, unknown>;
-  system: { emergency_stop: boolean; copying_paused: boolean };
-  members: {
-    member_account_id: string;
-    label: string;
-    mode: string;
-    symbol: string;
-    calculated_lot?: string;
-    final_lot?: string;
-    /** "broker" when the member's terminal reported real contract specs, else "fallback". */
-    spec_source?: string;
-    would_copy?: boolean;
-    reason?: string | null;
-    detail?: string | null;
-  }[];
-  summary: { total: number; would_copy: number };
-}
-
-export interface WsMessage {
-  type:
-    | "trade.event" | "copy.update" | "ea.status"
-    | "master.telemetry" | "system.alert" | "health" | "pong";
-  data: Record<string, unknown>;
+export interface TagRow {
+  id: string;
+  name: string;
+  color: string | null;
 }

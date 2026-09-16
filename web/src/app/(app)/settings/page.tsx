@@ -4,42 +4,59 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 
 import { PageHeader } from "@/components/app/page-header";
-import { ConfirmPhraseDialog } from "@/components/ui/dialog";
 import {
-  Badge, Button, Card, CardBody, CardHeader, ErrorNote, Skeleton,
+  Button, Card, CardBody, CardHeader, ErrorNote, Field, Input, Select, Skeleton,
 } from "@/components/ui/primitives";
-import { useAuth } from "@/hooks/useAuth";
 import { api } from "@/lib/api";
-import { formatTime } from "@/lib/utils";
 
-interface SystemSettings {
-  mode: "PAPER" | "LIVE";
-  copying_paused: boolean;
-  emergency_stop: boolean;
-  emergency_halts_telegram: boolean;
-  live_activated_at: string | null;
+interface Profile {
+  id: string;
+  email: string;
+  full_name: string | null;
+  role: string;
+  timezone: string;
+  session_windows: Record<string, [string, string]>;
+  totp_enabled: boolean;
 }
 
-export default function SettingsPage() {
-  const { can, user } = useAuth();
-  const queryClient = useQueryClient();
-  const [confirming, setConfirming] = React.useState<null | "LIVE" | "PAPER">(null);
+// A short, practical list beats every IANA zone in a dropdown nobody can scroll.
+const TIMEZONES = [
+  "UTC", "Europe/London", "Europe/Berlin", "Europe/Moscow", "Asia/Dubai",
+  "Asia/Kolkata", "Asia/Singapore", "Asia/Tokyo", "Australia/Sydney",
+  "America/New_York", "America/Chicago", "America/Los_Angeles",
+];
 
+export default function SettingsPage() {
+  const queryClient = useQueryClient();
   const { data, isLoading, error } = useQuery({
-    queryKey: ["settings"],
-    queryFn: () => api.get<SystemSettings>("/admin/settings"),
+    queryKey: ["profile"],
+    queryFn: () => api.get<Profile>("/settings/profile"),
   });
 
-  const setMode = useMutation({
-    mutationFn: (mode: "PAPER" | "LIVE") =>
-      api.post("/admin/mode", {
-        mode,
-        confirm: mode === "LIVE" ? "GO LIVE" : "BACK TO PAPER",
+  const [timezone, setTimezone] = React.useState("");
+  const [fullName, setFullName] = React.useState("");
+  const [dirty, setDirty] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!data) return;
+    setTimezone(data.timezone);
+    setFullName(data.full_name ?? "");
+    setDirty(false);
+  }, [data]);
+
+  const save = useMutation({
+    mutationFn: () =>
+      api.put<{ accounts_rebuilt: number }>("/settings/profile", {
+        timezone,
+        full_name: fullName || null,
       }),
     onSuccess: () => {
-      setConfirming(null);
-      queryClient.invalidateQueries({ queryKey: ["settings"] });
-      queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      setDirty(false);
+      queryClient.invalidateQueries({ queryKey: ["profile"] });
+      // Time buckets are computed in the trader's timezone, so every statistic moves.
+      queryClient.invalidateQueries({ queryKey: ["overview"] });
+      queryClient.invalidateQueries({ queryKey: ["breakdown"] });
+      queryClient.invalidateQueries({ queryKey: ["trades"] });
     },
   });
 
@@ -48,121 +65,92 @@ export default function SettingsPage() {
 
   return (
     <>
-      <PageHeader title="Settings" description="System-wide operating mode and safeguards." />
+      <PageHeader title="Settings" />
 
       <Card>
-        <CardHeader
-          title="Operating mode"
-          action={
-            <Badge tone={data.mode === "LIVE" ? "good" : "info"}>{data.mode}</Badge>
-          }
-        />
+        <CardHeader title="You" />
         <CardBody className="space-y-4">
-          <p className="text-sm text-fg-muted">
-            In <strong>LIVE</strong> mode copy orders reach real member terminals and
-            real brokers. In <strong>PAPER</strong> they are planned, risk-checked and
-            recorded identically, then filled by the simulator — useful for onboarding
-            one member without holding the others back.
-          </p>
-          <p className="text-sm text-fg-muted">
-            The mode is not what gates live trading. <strong>Copying is off for every
-            member until you enable it individually</strong>, so a LIVE system with
-            nobody enabled sends nothing.
-          </p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="Name">
+              <Input
+                value={fullName}
+                onChange={(event) => {
+                  setFullName(event.target.value);
+                  setDirty(true);
+                }}
+              />
+            </Field>
+            <Field label="Email">
+              <Input value={data.email} disabled />
+            </Field>
+          </div>
 
-          {data.live_activated_at ? (
-            <p className="text-xs text-fg-subtle">
-              LIVE activated {formatTime(data.live_activated_at)}.
+          <Field
+            label="Your timezone"
+            hint="Statistics like 'profit by hour' are worked out in this timezone, not the broker's. Changing it recalculates your existing trades."
+          >
+            <Select
+              value={timezone}
+              onChange={(event) => {
+                setTimezone(event.target.value);
+                setDirty(true);
+              }}
+            >
+              {TIMEZONES.map((zone) => (
+                <option key={zone} value={zone}>{zone}</option>
+              ))}
+            </Select>
+          </Field>
+
+          {save.data && save.data.accounts_rebuilt > 0 ? (
+            <p className="text-xs text-long">
+              Saved. Recalculated {save.data.accounts_rebuilt} account
+              {save.data.accounts_rebuilt === 1 ? "" : "s"} against the new timezone.
             </p>
           ) : null}
+          {save.error ? <ErrorNote error={save.error} /> : null}
 
-          {can("SUPER_ADMIN") ? (
-            <div className="flex gap-2">
-              {data.mode === "PAPER" ? (
-                <Button variant="danger" onClick={() => setConfirming("LIVE")}>
-                  Switch to LIVE
-                </Button>
-              ) : (
-                <Button variant="secondary" onClick={() => setConfirming("PAPER")}>
-                  Return to PAPER
-                </Button>
-              )}
-            </div>
-          ) : (
-            <p className="text-xs text-fg-subtle">
-              Only a SUPER_ADMIN can change the operating mode. You are signed in as{" "}
-              {user?.role.replace("_", " ")}.
-            </p>
-          )}
-
-          {setMode.error ? <ErrorNote error={setMode.error} /> : null}
+          <Button variant="primary" disabled={!dirty || save.isPending} onClick={() => save.mutate()}>
+            {save.isPending ? "Saving…" : "Save"}
+          </Button>
         </CardBody>
       </Card>
 
       <Card>
-        <CardHeader title="Current safeguards" />
-        <CardBody className="grid gap-3 sm:grid-cols-3 text-sm">
-          <Safeguard label="Copying paused" active={data.copying_paused} />
-          <Safeguard label="Emergency stop" active={data.emergency_stop} />
-          <Safeguard
-            label="Emergency also halts Telegram"
-            active={data.emergency_halts_telegram}
-          />
-        </CardBody>
-      </Card>
-
-      <Card>
-        <CardHeader title="Before you enable the first member" />
+        <CardHeader title="Trading sessions" />
         <CardBody>
-          <ol className="list-decimal space-y-1.5 pl-5 text-sm text-fg-muted">
-            <li>Master EA shows ONLINE and a real trade has appeared on the Trades page.</li>
-            <li>
-              Every member terminal shows ONLINE, and their contract specifications have
-              arrived — the Risk dry run says <code>broker</code>, not{" "}
-              <code>fallback</code>, as the spec source.
-            </li>
-            <li>Risk limits are set for every member, especially max lot and daily loss.</li>
-            <li>The Telegram channel has received a test message.</li>
-            <li>A dry run on the Risk page produces exactly the lot sizes you expect.</li>
-            <li>You know where the emergency stop is, and who can clear it.</li>
-            <li>
-              Enable members <strong>one at a time, smallest account first</strong>, and
-              check Copy Orders after each live trade before enabling the next.
-            </li>
-          </ol>
+          <p className="mb-3 text-sm text-fg-muted">
+            Used for the session breakdown. Times are UTC, because session boundaries
+            are conventionally quoted that way.
+          </p>
+          <dl className="grid gap-2 sm:grid-cols-2">
+            {Object.entries(data.session_windows).map(([name, span]) => (
+              <div
+                key={name}
+                className="flex items-center justify-between rounded-md border border-line px-3 py-2 text-sm"
+              >
+                <dt className="capitalize text-fg-muted">{name}</dt>
+                <dd className="tabular">{span[0]} – {span[1]}</dd>
+              </div>
+            ))}
+          </dl>
         </CardBody>
       </Card>
 
-      <ConfirmPhraseDialog
-        open={confirming === "LIVE"}
-        onClose={() => setConfirming(null)}
-        onConfirm={() => setMode.mutate("LIVE")}
-        title="Switch to LIVE trading"
-        description="Copy orders will be sent to real member terminals and placed with their brokers. Every admin is notified and the change is audited."
-        phrase="GO LIVE"
-        confirmLabel="Go live"
-        pending={setMode.isPending}
-      />
-      <ConfirmPhraseDialog
-        open={confirming === "PAPER"}
-        onClose={() => setConfirming(null)}
-        onConfirm={() => setMode.mutate("PAPER")}
-        title="Return to PAPER mode"
-        description="New copy orders will be simulated instead of executed. Positions already open at members' brokers are not affected."
-        phrase="BACK TO PAPER"
-        confirmLabel="Return to paper"
-        tone="warn"
-        pending={setMode.isPending}
-      />
+      <Card>
+        <CardHeader title="Your data" />
+        <CardBody className="space-y-2 text-sm text-fg-muted">
+          <p>
+            Every trade here is rebuilt from what your broker reported, which is stored
+            untouched. If a calculation is ever wrong, it can be fixed and recalculated
+            without you losing anything you wrote.
+          </p>
+          <p>
+            Your notes are kept separately from the calculated trades, so recalculating
+            never deletes them.
+          </p>
+        </CardBody>
+      </Card>
     </>
-  );
-}
-
-function Safeguard({ label, active }: { label: string; active: boolean }) {
-  return (
-    <div className="flex items-center justify-between rounded-md border border-line px-3 py-2">
-      <span className="text-fg-muted">{label}</span>
-      <Badge tone={active ? "warn" : "neutral"}>{active ? "active" : "off"}</Badge>
-    </div>
   );
 }

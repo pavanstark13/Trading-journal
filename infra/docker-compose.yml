@@ -1,6 +1,6 @@
 # Single-host deployment. Only caddy publishes ports; postgres and redis are
 # reachable on the internal network only.
-name: tradebridge
+name: trading-journal
 
 services:
   caddy:

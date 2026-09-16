@@ -144,8 +144,10 @@ def _decimalize(value: Any) -> Any:
     return value
 
 
-def summary_payload(records: list[metrics.TradeRecord]) -> dict[str, Any]:
-    summary = metrics.summarize(records)
+def summary_payload(
+    records: list[metrics.TradeRecord], starting_balance: Decimal = Decimal("0")
+) -> dict[str, Any]:
+    summary = metrics.summarize(records, starting_balance)
     payload = _decimalize(asdict(summary))
     # Sample size travels with every number, so the UI can never show a bare
     # percentage computed from six trades.

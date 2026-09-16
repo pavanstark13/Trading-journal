@@ -4,193 +4,287 @@ import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 
 import { PageHeader } from "@/components/app/page-header";
+import { BarBreakdown, formatHour } from "@/components/charts/bar-breakdown";
+import { EquityCurve } from "@/components/charts/equity-curve";
 import {
-  Card, CardBody, CardHeader, ConnectionDot, EmptyState, ErrorNote,
-  SideBadge, Skeleton, Stat, StatusBadge, Table, Td, Th,
+  Badge, Card, CardBody, CardHeader, EmptyState, ErrorNote, Skeleton,
 } from "@/components/ui/primitives";
-import { useLiveFeed } from "@/hooks/useLiveFeed";
 import { api } from "@/lib/api";
-import type { DashboardData } from "@/lib/types";
-import { formatTime, num, relativeTime } from "@/lib/utils";
-
-const COMPONENTS = [
-  ["master_ea", "Master EA"],
-  ["database", "Database"],
-  ["redis", "Redis"],
-  ["worker", "Worker"],
-  ["telegram", "Telegram"],
-] as const;
+import type { AccountRow, Overview } from "@/lib/types";
+import { cn, num, signed } from "@/lib/utils";
 
 export default function DashboardPage() {
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["dashboard"],
-    queryFn: () => api.get<DashboardData>("/admin/dashboard"),
-    refetchInterval: 30_000,
+  const overview = useQuery({
+    queryKey: ["overview"],
+    queryFn: () => api.get<Overview>("/stats/overview"),
   });
-  const { events, health: liveHealth } = useLiveFeed();
+  const accounts = useQuery({
+    queryKey: ["accounts"],
+    queryFn: () => api.get<AccountRow[]>("/accounts"),
+  });
 
-  if (error) return <ErrorNote error={error} />;
-  if (isLoading || !data) {
+  if (overview.error) return <ErrorNote error={overview.error} />;
+  if (overview.isLoading || !overview.data) {
     return (
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {Array.from({ length: 8 }).map((_, index) => (
-          <Skeleton key={index} className="h-24" />
-        ))}
+      <div className="space-y-4">
+        <Skeleton className="h-9 w-48" />
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-24" />)}
+        </div>
+        <Skeleton className="h-72" />
       </div>
     );
   }
 
-  const health = { ...data.health, ...liveHealth };
-  const copyTotal =
-    data.counts.copies_successful + data.counts.copies_failed + data.counts.copies_rejected;
+  const { summary, curves, by_symbol, by_hour, behaviour } = overview.data;
+  const currency = accounts.data?.[0]?.currency ?? "";
+
+  if (summary.trades === 0) {
+    return (
+      <>
+        <PageHeader title="Overview" />
+        <Card>
+          <EmptyState
+            title="No trades yet"
+            hint="Connect a MetaTrader account and your whole history uploads automatically — you do not type anything in."
+          />
+          <CardBody className="flex justify-center pb-6 pt-0">
+            <Link
+              href="/accounts"
+              className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-accent-fg hover:brightness-110"
+            >
+              Connect an account
+            </Link>
+          </CardBody>
+        </Card>
+      </>
+    );
+  }
 
   return (
     <>
       <PageHeader
-        title="Operations overview"
-        description="Live state of the bridge, the channel and every member copier."
+        title="Overview"
+        description={`${summary.trades} closed trades`}
+        action={
+          summary.low_confidence ? (
+            <Badge tone="warn">
+              Under {summary.min_meaningful_sample} trades — treat these as indicative
+            </Badge>
+          ) : null
+        }
       />
 
-      {/* Component health reads left to right in the order failures cascade. */}
-      <Card>
-        <CardHeader title="System status" />
-        <div className="grid divide-y divide-line sm:grid-cols-5 sm:divide-x sm:divide-y-0">
-          {COMPONENTS.map(([key, label]) => (
-            <div key={key} className="flex items-center gap-2.5 px-4 py-3">
-              <ConnectionDot status={health[key] ?? "UNKNOWN"} />
-              <div className="min-w-0">
-                <p className="truncate text-xs font-medium">{label}</p>
-                <p className="text-2xs text-fg-subtle">{health[key] ?? "UNKNOWN"}</p>
-              </div>
-            </div>
-          ))}
-        </div>
-      </Card>
-
+      {/* The headline is one number, so it gets a hero tile rather than a chart. */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Stat
-          label="Master equity"
-          value={data.master ? num(data.master.equity) : "—"}
-          sub={
-            data.master
-              ? `Balance ${num(data.master.balance)} · ${data.master.open_positions ?? 0} open`
-              : "No master account configured"
-          }
+        <Headline
+          label="Net profit"
+          value={signed(summary.net_profit)}
+          sub={currency}
+          tone={Number.parseFloat(summary.net_profit) >= 0 ? "good" : "bad"}
         />
-        <Stat
-          label="Members connected"
-          value={`${data.counts.members_connected}/${data.counts.members}`}
-          sub="EA heartbeat within 90s"
+        <Headline
+          label="Expectancy"
+          value={summary.expectancy_r ? `${signed(summary.expectancy_r, 2)}R` : "—"}
+          sub={
+            summary.expectancy_r
+              ? "Average result per trade risked"
+              : "Needs trades with a stop loss"
+          }
           tone={
-            data.counts.members > 0 && data.counts.members_connected === 0 ? "bad" : undefined
+            summary.expectancy_r
+              ? Number.parseFloat(summary.expectancy_r) >= 0 ? "good" : "bad"
+              : undefined
           }
         />
-        <Stat
-          label="Trades today"
-          value={data.counts.trades_today}
-          sub={
-            data.master?.last_heartbeat_at
-              ? `Last heartbeat ${relativeTime(data.master.last_heartbeat_at)}`
-              : "Waiting for the master EA"
-          }
+        <Headline
+          label="Win rate"
+          value={summary.win_rate ? `${num(summary.win_rate, 0)}%` : "—"}
+          sub={`${summary.wins}W · ${summary.losses}L${
+            summary.scratches ? ` · ${summary.scratches} scratch` : ""
+          }`}
         />
-        <Stat
-          label="Copies today"
-          value={data.counts.copies_successful}
+        <Headline
+          label="Max drawdown"
+          value={num(summary.max_drawdown)}
           sub={
-            copyTotal === 0
-              ? "No copy activity yet"
-              : `${data.counts.copies_failed} failed · ${data.counts.copies_rejected} rejected`
+            summary.max_drawdown_pct
+              ? `${num(summary.max_drawdown_pct, 1)}% off peak`
+              : "No drawdown yet"
           }
-          tone={data.counts.copies_failed > 0 ? "warn" : undefined}
+          tone={Number.parseFloat(summary.max_drawdown) > 0 ? "bad" : undefined}
         />
       </div>
 
-      {data.counts.dead_letters > 0 ? (
-        <Card className="border-danger/40 bg-danger/5">
-          <CardBody className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-sm font-medium text-danger">
-                {data.counts.dead_letters} message(s) in the dead-letter queue
-              </p>
-              <p className="mt-0.5 text-xs text-fg-muted">
-                These were retried to exhaustion and never delivered. They need a decision.
-              </p>
-            </div>
-            <Link href="/system-health" className="text-xs font-medium text-accent underline">
-              Review
-            </Link>
-          </CardBody>
-        </Card>
-      ) : null}
+      <Card>
+        <CardHeader
+          title="Account equity"
+          action={
+            <span className="text-2xs text-fg-subtle">
+              After each closed trade
+            </span>
+          }
+        />
+        <CardBody>
+          <EquityCurve points={curves.equity} currency={currency} />
+        </CardBody>
+      </Card>
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        <Card className="lg:col-span-2">
-          <CardHeader
-            title="Recent master events"
-            action={
-              <Link href="/trades" className="text-xs text-accent hover:underline">
-                All trades →
-              </Link>
-            }
-          />
-          {data.recent_events.length === 0 ? (
-            <EmptyState
-              title="No events received yet"
-              hint="Once the master EA is attached and a trade is taken, it appears here within a second."
-            />
-          ) : (
-            <Table>
-              <thead>
-                <tr>
-                  <Th>Time</Th>
-                  <Th>Event</Th>
-                  <Th>Symbol</Th>
-                  <Th>Side</Th>
-                  <Th className="text-right">Volume</Th>
-                  <Th className="text-right">Price</Th>
-                  <Th>Status</Th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.recent_events.map((event) => (
-                  <tr key={event.id} className="hover:bg-bg-sunken/60">
-                    <Td className="tabular whitespace-nowrap text-xs text-fg-muted">
-                      {formatTime(event.occurred_at)}
-                    </Td>
-                    <Td className="text-xs">{event.event_type.replace(/_/g, " ")}</Td>
-                    <Td className="font-medium">{event.symbol ?? "—"}</Td>
-                    <Td><SideBadge side={event.side} /></Td>
-                    <Td className="tabular text-right">{num(event.volume)}</Td>
-                    <Td className="tabular text-right">{num(event.price, 5)}</Td>
-                    <Td><StatusBadge status={event.processing_status} /></Td>
-                  </tr>
-                ))}
-              </tbody>
-            </Table>
-          )}
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader title="Profit by instrument" />
+          <CardBody>
+            <BarBreakdown buckets={by_symbol} label="Best and worst instruments" />
+          </CardBody>
         </Card>
 
         <Card>
-          <CardHeader title="Live activity" />
-          <div className="max-h-[420px] overflow-y-auto">
-            {events.length === 0 ? (
-              <EmptyState title="Listening…" hint="Events appear here as they arrive." />
-            ) : (
-              <ul className="divide-y divide-line/60">
-                {events.map((event, index) => (
-                  <li key={index} className="px-4 py-2 text-xs">
-                    <span className="text-fg-subtle">{event.type}</span>
-                    <p className="mt-0.5 truncate text-fg-muted">
-                      {JSON.stringify(event.data)}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
+          <CardHeader title="Profit by hour of day" />
+          <CardBody>
+            <BarBreakdown
+              buckets={by_hour}
+              label="In your timezone"
+              formatKey={formatHour}
+            />
+          </CardBody>
         </Card>
       </div>
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <SecondaryStat
+          label="Profit factor"
+          value={summary.profit_factor ? num(summary.profit_factor, 2) : "—"}
+          hint={
+            summary.profit_factor
+              ? "Money won for every 1 lost"
+              : "No losing trades yet, so this is undefined"
+          }
+        />
+        <SecondaryStat
+          label="Average win / loss"
+          value={`${num(summary.avg_win)} / ${num(summary.avg_loss)}`}
+          hint={`Longest streak: ${summary.longest_win_streak}W, ${summary.longest_loss_streak}L`}
+        />
+        <SecondaryStat
+          label="Trades without a stop"
+          value={String(summary.trades_without_stop)}
+          hint={
+            summary.trades_without_stop > 0
+              ? "These are excluded from R and expectancy"
+              : "Every trade had a stop loss"
+          }
+          tone={summary.trades_without_stop > 0 ? "warn" : undefined}
+        />
+      </div>
+
+      <Card>
+        <CardHeader title="Discipline" />
+        <CardBody className="grid gap-4 sm:grid-cols-2">
+          <Comparison
+            title="After a losing trade"
+            left={{ label: "Follows a loss", ...behaviour.after_a_loss.after_loss }}
+            right={{ label: "Everything else", ...behaviour.after_a_loss.otherwise }}
+            note="A large gap here is revenge trading with a number attached."
+          />
+          <Comparison
+            title="Followed your plan"
+            left={{ label: "Followed", ...behaviour.plan_adherence.followed }}
+            right={{ label: "Deviated", ...behaviour.plan_adherence.deviated }}
+            note={
+              behaviour.plan_adherence.unjournalled > 0
+                ? `${behaviour.plan_adherence.unjournalled} trades not written up yet.`
+                : "Every trade is written up."
+            }
+          />
+        </CardBody>
+      </Card>
     </>
+  );
+}
+
+function Headline({
+  label, value, sub, tone,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  tone?: "good" | "bad";
+}) {
+  return (
+    <Card className="p-4">
+      <p className="text-2xs font-semibold uppercase tracking-wider text-fg-subtle">
+        {label}
+      </p>
+      <p
+        className={cn(
+          "mt-1.5 text-3xl font-semibold leading-none",
+          tone === "good" && "text-long",
+          tone === "bad" && "text-short",
+        )}
+      >
+        {value}
+      </p>
+      {sub ? <p className="mt-2 text-xs text-fg-muted">{sub}</p> : null}
+    </Card>
+  );
+}
+
+function SecondaryStat({
+  label, value, hint, tone,
+}: {
+  label: string;
+  value: string;
+  hint: string;
+  tone?: "warn";
+}) {
+  return (
+    <Card className="p-4">
+      <p className="text-2xs font-semibold uppercase tracking-wider text-fg-subtle">
+        {label}
+      </p>
+      <p className={cn("tabular mt-1.5 text-xl font-semibold", tone === "warn" && "text-warn")}>
+        {value}
+      </p>
+      <p className="mt-1.5 text-xs text-fg-muted">{hint}</p>
+    </Card>
+  );
+}
+
+function Comparison({
+  title, left, right, note,
+}: {
+  title: string;
+  left: { label: string; trades: number; net_profit: string; expectancy_r: string | null };
+  right: { label: string; trades: number; net_profit: string; expectancy_r: string | null };
+  note: string;
+}) {
+  return (
+    <div>
+      <p className="mb-2 text-xs font-medium">{title}</p>
+      <div className="grid grid-cols-2 gap-2">
+        {[left, right].map((side) => {
+          const value = Number.parseFloat(side.net_profit);
+          return (
+            <div key={side.label} className="rounded-md border border-line px-3 py-2">
+              <p className="text-2xs text-fg-subtle">{side.label}</p>
+              <p
+                className={cn(
+                  "tabular text-lg font-semibold",
+                  value > 0 && "text-long",
+                  value < 0 && "text-short",
+                )}
+              >
+                {signed(side.net_profit)}
+              </p>
+              <p className="text-2xs text-fg-subtle">
+                {side.trades} trade{side.trades === 1 ? "" : "s"}
+                {side.expectancy_r ? ` · ${signed(side.expectancy_r, 2)}R` : ""}
+              </p>
+            </div>
+          );
+        })}
+      </div>
+      <p className="mt-1.5 text-2xs text-fg-subtle">{note}</p>
+    </div>
   );
 }

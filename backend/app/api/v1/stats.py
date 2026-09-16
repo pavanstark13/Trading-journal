@@ -64,7 +64,19 @@ async def summary(
         tag_id, date_from, date_to,
     )
     records = await stats_service.load_records(db, filters)
-    return stats_service.summary_payload(records)
+    opening = await _opening_balance(db, filters.account_ids)
+    return stats_service.summary_payload(records, opening)
+
+
+async def _opening_balance(db: AsyncSession, account_ids: list[uuid.UUID]) -> Decimal:
+    """Combined starting balance, so drawdown can be expressed as a percentage of
+    the account rather than of cumulative profit."""
+    total = Decimal("0")
+    for account in (
+        await db.execute(select(Account).where(Account.id.in_(account_ids)))
+    ).scalars():
+        total += await rebuild.starting_balance(db, account)
+    return total
 
 
 @router.get("/breakdown/{dimension}")
@@ -111,18 +123,7 @@ async def curves(
         db, principal, account_id, None, None, None, None, None, date_from, date_to
     )
     records = await stats_service.load_records(db, filters)
-
-    opening = Decimal("0")
-    if account_id:
-        account = await db.get(Account, account_id)
-        if account:
-            opening = await rebuild.starting_balance(db, account)
-    else:
-        for account in (
-            await db.execute(select(Account).where(Account.id.in_(filters.account_ids)))
-        ).scalars():
-            opening += await rebuild.starting_balance(db, account)
-
+    opening = await _opening_balance(db, filters.account_ids)
     payload = stats_service.curves_payload(records, opening)
     payload["starting_balance"] = str(opening)
     return payload
@@ -155,15 +156,10 @@ async def overview(
         db, principal, account_id, None, None, None, None, None, None, None
     )
     records = await stats_service.load_records(db, filters)
-
-    opening = Decimal("0")
-    for account in (
-        await db.execute(select(Account).where(Account.id.in_(filters.account_ids)))
-    ).scalars():
-        opening += await rebuild.starting_balance(db, account)
+    opening = await _opening_balance(db, filters.account_ids)
 
     return {
-        "summary": stats_service.summary_payload(records),
+        "summary": stats_service.summary_payload(records, opening),
         "by_symbol": stats_service.breakdown_payload(records, "symbol")[:8],
         "by_hour": stats_service.breakdown_payload(records, "hour"),
         "by_weekday": stats_service.breakdown_payload(records, "weekday"),

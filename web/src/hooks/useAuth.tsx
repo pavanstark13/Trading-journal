@@ -14,7 +14,7 @@ interface AuthValue {
   can: (minimum: Role) => boolean;
 }
 
-const RANK: Record<Role, number> = { MEMBER: 0, ADMIN: 1, SUPER_ADMIN: 2 };
+const RANK: Record<Role, number> = { MEMBER: 0, ADMIN: 1 };
 
 const AuthContext = React.createContext<AuthValue | null>(null);
 

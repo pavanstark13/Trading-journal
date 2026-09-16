@@ -4,8 +4,8 @@ import "./globals.css";
 import { Providers } from "./providers";
 
 export const metadata: Metadata = {
-  title: "TradeBridge",
-  description: "MT5 trade distribution and copy control",
+  title: "Trading Journal",
+  description: "Your MetaTrader trades, written up and measured",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

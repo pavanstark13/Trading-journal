@@ -44,10 +44,10 @@ export default function LoginPage() {
         <div className="mb-6">
           <div className="flex items-center gap-2">
             <span className="h-2.5 w-2.5 rounded-full bg-accent" />
-            <h1 className="text-lg font-semibold tracking-tight">TradeBridge</h1>
+            <h1 className="text-lg font-semibold tracking-tight">Trading Journal</h1>
           </div>
           <p className="mt-1 text-xs text-fg-muted">
-            MT5 trade distribution and copy control
+            Your MetaTrader trades, written up and measured
           </p>
         </div>
 

@@ -33,35 +33,16 @@ class Settings(BaseSettings):
     login_max_attempts: int = 5
     login_lockout_threshold: int = 10
 
-    # ── EA ──────────────────────────────────────────────────────────────────
+    # ── MetaTrader link ─────────────────────────────────────────────────────
     ea_timestamp_skew_sec: int = 120
     ea_nonce_ttl_sec: int = 300
-    ea_event_batch_max: int = 100
-    member_poll_wait_sec: int = 25
-    member_heartbeat_timeout_sec: int = 90
-    master_heartbeat_timeout_sec: int = 120
-
-    # ── trading mode ────────────────────────────────────────────────────────
-    #: Mode a fresh installation starts in. LIVE by default; the per-member
-    #: copy_enabled flag (off by default) remains the gate that decides whether
-    #: anyone actually receives a trade.
-    default_mode: Literal["PAPER", "LIVE"] = "LIVE"
-
-    # ── copy engine ─────────────────────────────────────────────────────────
-    default_max_signal_age_sec: int = 60
-    copy_lease_ttl_sec: int = 45
-
-    # ── telegram ────────────────────────────────────────────────────────────
-    telegram_api_base: str = "https://api.telegram.org"
-    telegram_max_retries: int = 6
-    telegram_rate_limit_per_sec: int = 20
+    ea_event_batch_max: int = 500
+    #: A terminal quieter than this is shown as not syncing.
+    heartbeat_timeout_sec: int = 600
 
     # ── observability ───────────────────────────────────────────────────────
     sentry_dsn: str = ""
     prometheus_enabled: bool = True
-
-    # ── event id namespace (must match the EA's compiled-in value) ──────────
-    event_id_namespace: str = "tradebridge.local"
 
     @field_validator("jwt_secret", "master_encryption_key")
     @classmethod

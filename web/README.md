@@ -1,49 +1,61 @@
-# TradeBridge Dashboard
+# The website
 
-Next.js 15 (App Router) · TypeScript · Tailwind · TanStack Query · WebSocket.
+Next.js 15 (App Router) · TypeScript · Tailwind · TanStack Query.
 
 ```bash
 npm install
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8000 npm run dev
 ```
 
-## How it is put together
-
-- **`src/lib/api.ts`** — the only place that talks to the backend. Access tokens live
-  in memory, never `localStorage`, so an XSS cannot lift one; the refresh token is an
-  HttpOnly cookie. A 401 triggers exactly one refresh, shared between concurrent callers.
-- **`src/hooks/useLiveFeed.tsx`** — one WebSocket for the whole console. Incoming
-  messages invalidate the specific React Query caches that changed, so tables update
-  themselves without any page polling.
-- **`src/components/ui/primitives.tsx`** — the design system. `StatusBadge` is the single
-  place that decides what each status colour means, so the whole console agrees:
-  green is filled, amber is waiting, red is blocked.
-- **`ConfirmPhraseDialog`** — destructive actions require typing an exact phrase.
-  A button you can hit by accident is not a safeguard, and these actions start and stop
-  real order flow.
-
 ## Pages
 
-| Route | Purpose |
+| Route | What it is for |
 |---|---|
-| `/dashboard` | Component health, master telemetry, today's counts, live activity |
-| `/trades` | Every master event, with Telegram and copy status; click for the full lifecycle |
-| `/copy-orders` | Every planned instruction, including rejections and why |
-| `/master-account` | Balance, equity, margin, open positions, bridge status |
-| `/members`, `/members/[id]` | Member list; per-member copy settings and risk limits |
-| `/risk` | Dry-run simulator and blocked-copy analytics |
-| `/telegram` | Channels, template, delivery queue, test message |
-| `/ea-installations` | Every authorized terminal; rotate or revoke credentials |
-| `/system-health` | Per-component detail and the dead-letter queue |
-| `/audit-logs` | Append-only record of privileged actions |
-| `/settings` | PAPER/LIVE mode and the go-live checklist |
+| `/dashboard` | The headline numbers, equity curve, and where money is made and lost |
+| `/trades` | Every trade, filterable, showing which are still unwritten |
+| `/trades/[id]` | One trade in full, with the note editor and the broker records behind it |
+| `/calendar` | A month at a glance, and the place to write a daily review |
+| `/analytics` | Result distribution and every performance breakdown |
+| `/playbook` | Named setups and tags, so the analytics have something to group by |
+| `/accounts` | Connect MetaTrader, with the install steps |
+| `/settings` | Timezone and session windows |
 
-Everything renders from real backend APIs. There is no mock data anywhere in this app.
+## How it is put together
+
+- **`src/lib/api.ts`** is the only place that talks to the backend. Access tokens live
+  in memory, never `localStorage`, so an XSS cannot lift one; the refresh token is an
+  HttpOnly cookie. A 401 triggers exactly one refresh, shared between concurrent callers.
+- **`src/lib/palette.ts`** holds the chart colours and the reason for them.
+- **`src/components/charts/`** are hand-built SVG and CSS rather than a chart library.
+  That is deliberate: the mark weights, the crosshair and the theme tokens all needed to
+  be exact, and fighting a library's defaults costs more than writing 150 lines.
+
+## Chart rules
+
+**Profit and loss is a polarity encoding**, so it uses a diverging pair with a neutral
+midpoint — not two arbitrary series colours, and never a value ramp (bar length already
+carries magnitude).
+
+The obvious pair, green against red, was **rejected on measurement**: it scores a CVD
+ΔE of 4.1 for deutan vision, far below the ΔE 8 floor, meaning roughly one man in twelve
+could not tell a winning day from a losing one. The pair actually used is a teal-leaning
+green against the same red:
+
+```
+#0e9f8a  profit        CVD ΔE 10.6 (deutan)
+#d03b3b  loss          normal-vision ΔE 29.7 · contrast ≥ 3:1 on both surfaces
+```
+
+One pair serves light and dark. It still reads unmistakably as profit and loss.
+
+Colour is never the only channel regardless: every figure carries a sign, and bars sit
+above or below a zero baseline.
 
 ## Conventions
 
-- Money and prices arrive as **strings** and are formatted with `num()` — never parsed
-  into a float and re-serialised, which is how rounding errors get into a UI.
-- Numeric columns carry the `tabular` class so digits align; a price column that jitters
-  is unreadable at a glance, which is the only way anyone reads it.
-- Dark by default. An operations console is looked at for hours.
+- Money and prices arrive from the API as **strings** and are formatted, never parsed
+  into a float and re-serialised — that is how rounding errors get into a UI.
+- Numeric columns carry `tabular` so digits line up. A price column that jitters cannot
+  be read at a glance, which is the only way anyone reads one.
+- A statistic with too small a sample is **marked, not hidden**. `n=13` beside a number
+  is the difference between an insight and a coin flip.

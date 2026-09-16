@@ -103,14 +103,21 @@ def classify(trade: TradeRecord) -> str:
     return "win" if trade.net_profit > ZERO else "loss"
 
 
-def max_drawdown(trades: Iterable[TradeRecord]) -> tuple[Decimal, Decimal | None]:
-    """Peak-to-trough of the cumulative closed-trade equity curve.
+def max_drawdown(
+    trades: Iterable[TradeRecord], starting_balance: Decimal = ZERO
+) -> tuple[Decimal, Decimal | None]:
+    """Peak-to-trough of the closed-trade equity curve.
 
-    Returns (absolute, percent-of-peak). Percent is None until the curve has been
-    above zero, because a drawdown percentage from a zero peak is meaningless.
+    Returns (absolute, percent-of-peak).
+
+    The percentage is measured against **account equity**, which is why the starting
+    balance matters: a 460 drawdown on a 10,000 account is 4.6%, but measured against
+    cumulative profit alone it can read as 46% -- a number that would tell a trader
+    they nearly blew up when they did not. Without a known starting balance the
+    percentage is None rather than that misleading figure.
     """
-    equity = ZERO
-    peak = ZERO
+    equity = starting_balance
+    peak = starting_balance
     worst = ZERO
     worst_pct: Decimal | None = None
 
@@ -120,7 +127,7 @@ def max_drawdown(trades: Iterable[TradeRecord]) -> tuple[Decimal, Decimal | None
         drop = peak - equity
         if drop > worst:
             worst = drop
-            if peak > ZERO:
+            if starting_balance > ZERO and peak > ZERO:
                 worst_pct = _q(drop / peak * Decimal(100))
     return _q(worst), worst_pct
 
@@ -141,8 +148,14 @@ def streaks(trades: Iterable[TradeRecord]) -> tuple[int, int]:
     return best_win, best_loss
 
 
-def summarize(trades: list[TradeRecord]) -> Summary:
-    """The headline numbers for a set of closed trades."""
+def summarize(
+    trades: list[TradeRecord], starting_balance: Decimal = ZERO
+) -> Summary:
+    """The headline numbers for a set of closed trades.
+
+    `starting_balance` is only used to express drawdown as a percentage of the
+    account; every other figure is independent of it.
+    """
     total = len(trades)
     if total == 0:
         return Summary(
@@ -198,7 +211,7 @@ def summarize(trades: list[TradeRecord]) -> Summary:
             sqn = _q(Decimal(str(math.sqrt(len(r_values)))) * mean_r / deviation, "0.01")
 
     durations = [t.duration_seconds for t in trades if t.duration_seconds is not None]
-    drawdown, drawdown_pct = max_drawdown(trades)
+    drawdown, drawdown_pct = max_drawdown(trades, starting_balance)
     win_streak, loss_streak = streaks(trades)
 
     return Summary(

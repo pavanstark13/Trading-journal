@@ -156,9 +156,9 @@ def test_max_drawdown_is_peak_to_trough() -> None:
         trade("100", minutes=1), trade("100", minutes=2),
         trade("-150", minutes=3), trade("20", minutes=4),
     ]
-    absolute, percent = max_drawdown(trades)
+    absolute, percent = max_drawdown(trades, starting_balance=Decimal("1000"))
     assert absolute == Decimal("150.00")
-    assert percent == Decimal("75.00")        # 150 off a peak of 200
+    assert percent == Decimal("12.50")        # 150 off a peak of 1,200
 
 
 def test_drawdown_is_zero_on_a_straight_up_curve() -> None:
@@ -289,3 +289,35 @@ def test_a_small_loss_is_never_rounded_away() -> None:
     s = summarize([trade("-0.4", minutes=1), trade("100", minutes=2)])
     assert s.net_profit == Decimal("99.60")
     assert s.losses == 1
+
+
+# ── drawdown is a percentage of the ACCOUNT, not of cumulative profit ───────────
+
+def test_drawdown_percent_is_measured_against_account_equity() -> None:
+    """A 460 dip on a 10,000 account is 4.6%, not 46%.
+
+    Measured against cumulative profit alone it reads as 46% -- a number that tells
+    a trader they nearly blew up when they never came close.
+    """
+    trades = [
+        trade("1000", minutes=1),
+        trade("-460", minutes=2),
+    ]
+    absolute, percent = max_drawdown(trades, starting_balance=Decimal("10000"))
+    assert absolute == Decimal("460.00")
+    assert percent == Decimal("4.18")        # 460 off a peak of 11,000
+
+
+def test_drawdown_percent_is_none_without_a_starting_balance() -> None:
+    """Better no percentage than a wildly overstated one."""
+    _, percent = max_drawdown([trade("1000", minutes=1), trade("-460", minutes=2)])
+    assert percent is None
+
+
+def test_summary_passes_the_starting_balance_through() -> None:
+    summary = summarize(
+        [trade("1000", minutes=1), trade("-460", minutes=2)],
+        starting_balance=Decimal("10000"),
+    )
+    assert summary.max_drawdown == Decimal("460.00")
+    assert summary.max_drawdown_pct == Decimal("4.18")
