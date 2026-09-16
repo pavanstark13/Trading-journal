@@ -64,13 +64,27 @@ requests, which breaks two things the VPS deployment relies on:
   its own — a hundred short-lived functions each holding ten connections would
   exhaust Postgres. Use your provider's **pooled** connection string.
 
-Managed pieces to point it at:
+Managed pieces to point it at. All three install from the Vercel Marketplace,
+which writes their connection strings into the project as environment variables, so
+no password is ever copied by hand:
 
 | Need | Service | Note |
 |---|---|---|
-| Postgres | Neon | use the `-pooler` host in `DATABASE_URL` |
-| Redis | Upstash | rate limits, nonces, the live-update channel |
+| Postgres | Vercel Postgres (Neon), or Supabase | either is fine; use the **pooled** connection string |
+| Redis | Upstash | login rate limiting, EA nonces, the live-update channel |
 | MetaTrader access | MetaApi | free for one account |
+
+Vercel Postgres *is* Neon underneath, so "Vercel's database" and "Neon" are the same
+choice. Supabase works equally well. Whichever it is, take the pooled string --
+Supabase's port 6543, Neon's `-pooler` host -- because `SERVERLESS=true` turns off
+this application's own pool on the assumption that something else is doing it.
+
+Both pool in **transaction mode**, which the application already accounts for:
+consecutive statements can land on different backend connections, and a prepared
+statement only exists on one of them. asyncpg prepares every statement by default, so
+`SERVERLESS=true` also switches both statement caches off. Without that you get
+`prepared statement "__asyncpg_1__" does not exist` -- intermittent, under load only,
+and impossible to reproduce against a direct connection.
 
 Environment variables, on the API project:
 

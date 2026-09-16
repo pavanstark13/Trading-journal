@@ -234,3 +234,35 @@ async def test_a_network_failure_does_not_read_as_the_traders_mistake() -> None:
 
     assert exc.value.retryable is True
     assert "Nothing is wrong with your login details" in str(exc.value)
+
+
+# ── running against a pooled database ───────────────────────────────────────────
+def test_serverless_settings_are_safe_for_a_transaction_pooler(monkeypatch) -> None:
+    """Neon, Supabase and pgbouncer pool in transaction mode.
+
+    Consecutive statements can land on different backend connections, and a prepared
+    statement lives on one of them. Leaving asyncpg's cache on gives intermittent
+    `prepared statement does not exist` errors that cannot be reproduced locally.
+    """
+    from app.core import db as db_module
+
+    monkeypatch.setattr(settings, "serverless", True)
+    monkeypatch.setattr(
+        settings, "database_url", "postgresql+asyncpg://u:p@host-pooler/db"
+    )
+    kwargs = db_module._engine_kwargs()
+    assert kwargs["connect_args"]["statement_cache_size"] == 0
+    assert kwargs["poolclass"].__name__ == "NullPool"
+    assert "prepared_statement_cache_size=0" in db_module._engine_url()
+
+    # An existing query string is appended to, not clobbered.
+    monkeypatch.setattr(
+        settings, "database_url", "postgresql+asyncpg://u:p@host/db?ssl=require"
+    )
+    url = db_module._engine_url()
+    assert "ssl=require" in url and "&prepared_statement_cache_size=0" in url
+
+    # On a real server the pool is the right answer and stays.
+    monkeypatch.setattr(settings, "serverless", False)
+    assert db_module._engine_kwargs()["pool_size"] == 10
+    assert "prepared_statement_cache_size" not in db_module._engine_url()
