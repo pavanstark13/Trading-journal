@@ -32,6 +32,7 @@ class WorkerSettings:
     on_shutdown = shutdown
     functions: ClassVar[list[Any]] = [
         tasks.relay_outbox,
+        tasks.poll_providers,
         tasks.refresh_provisional,
         tasks.health_sweep,
     ]
@@ -39,6 +40,9 @@ class WorkerSettings:
         # Turns newly ingested deals into trades. A trader who just took a trade wants
         # to see it, so this runs often.
         cron(tasks.relay_outbox, second={s for s in range(0, 60, 3)}, run_at_startup=True),
+        # Cloud-hosted accounts are pulled rather than pushed. The interval that
+        # matters is PROVIDER_POLL_INTERVAL_SEC; this only decides how often we look.
+        cron(tasks.poll_providers, second={0}),
         cron(tasks.health_sweep, second={0, 30}),
         cron(tasks.refresh_provisional, hour={3}, minute={0}),
     ]

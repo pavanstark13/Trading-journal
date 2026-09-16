@@ -32,6 +32,11 @@ export interface AccountRow {
   open_positions: number | null;
   last_heartbeat_at: string | null;
   connected: boolean;
+  sync_source: "ea" | "cloud" | "report";
+  /** Set when the terminal is hosted for them rather than run by them. */
+  provider: string | null;
+  provider_state: string | null;
+  provider_synced_at: string | null;
   sync_status: string;
   sync_error: string | null;
   deal_count: number;

@@ -116,8 +116,17 @@ class Account(Base):
     #: 'hedging' or 'netting'. This decides how deals are grouped into trades, and
     #: getting it wrong silently corrupts every statistic.
     margin_mode: Mapped[str] = mapped_column(String(10), default="hedging")
-    #: 'ea' (terminal pushes) or 'report' (statement upload only)
+    #: 'ea' (terminal pushes), 'cloud' (we read history from a hosted terminal) or
+    #: 'report' (statement upload only)
     sync_source: Mapped[str] = mapped_column(String(16), default="ea")
+    #: Set when sync_source == 'cloud'. The provider holds the read-only credential;
+    #: we hold only this opaque handle, so there is no MT5 password in this database.
+    provider: Mapped[str | None] = mapped_column(String(16))
+    provider_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    provider_region: Mapped[str | None] = mapped_column(String(32))
+    #: The provider's own connection state, verbatim, e.g. DEPLOYED / DEPLOYING.
+    provider_state: Mapped[str | None] = mapped_column(String(24))
+    provider_synced_at: Mapped[datetime | None] = mapped_column(TS)
     starting_balance: Mapped[Decimal | None] = mapped_column(Money)
     balance: Mapped[Decimal | None] = mapped_column(Money)
     equity: Mapped[Decimal | None] = mapped_column(Money)

@@ -12,7 +12,7 @@ from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -257,3 +257,26 @@ async def starting_balance(db: AsyncSession, account: Account) -> Decimal:
         )
     ).scalar_one_or_none()
     return first.profit if first else Decimal("0")
+
+
+async def ledger_balance(db: AsyncSession, account_id: uuid.UUID) -> Decimal | None:
+    """Account balance summed from the broker's own deals.
+
+    Every deal moves the balance by profit + commission + swap + fee -- deposits
+    included, which MetaTrader records with the amount in `profit`. So the sum over a
+    complete history is the balance, exactly.
+
+    Only trustworthy when the history really is complete, which is why this is used
+    for cloud-read accounts (where we fetch the lot) and not for a terminal that
+    reports its balance directly. Returns None when there is nothing to sum.
+    """
+    total = (
+        await db.execute(
+            select(
+                func.sum(
+                    RawDeal.profit + RawDeal.commission + RawDeal.swap + RawDeal.fee
+                )
+            ).where(RawDeal.account_id == account_id)
+        )
+    ).scalar_one_or_none()
+    return None if total is None else Decimal(total).quantize(Decimal("0.01"))

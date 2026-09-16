@@ -6,11 +6,12 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
 
+from app.core.config import settings
 from app.core.db import SessionLocal
 from app.core.logging import get_logger
 from app.core.redis import WS_CHANNEL, get_redis
 from app.models import Account, Outbox, SystemHealth
-from app.services import rebuild
+from app.services import provider_sync, rebuild
 
 log = get_logger(__name__)
 
@@ -76,6 +77,23 @@ async def relay_outbox(_ctx: dict | None = None, batch: int = 50) -> int:
                     account.sync_error = str(exc)[:500]
                     await db.commit()
         return rebuilt
+
+
+async def poll_providers(_ctx: dict | None = None) -> dict[str, int]:
+    """Read history for accounts whose terminal lives in the provider's cloud.
+
+    Runs every minute; `due_accounts` decides who is actually read, so the polling
+    rate is a setting rather than a cron expression.
+    """
+    if not settings.metaapi_token:
+        return {"considered": 0, "synced": 0, "failed": 0}
+
+    async with SessionLocal() as db:
+        result = await provider_sync.poll_due(db)
+
+    if result["synced"]:
+        await broadcast("accounts.polled", result)
+    return result
 
 
 async def refresh_provisional(_ctx: dict | None = None) -> int:

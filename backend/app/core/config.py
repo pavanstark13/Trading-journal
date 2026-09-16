@@ -40,6 +40,30 @@ class Settings(BaseSettings):
     #: A terminal quieter than this is shown as not syncing.
     heartbeat_timeout_sec: int = 600
 
+    # ── cloud history provider (MetaApi) ────────────────────────────────────
+    #: A trader on an iPad cannot run an Expert Advisor -- MetaTrader's mobile apps
+    #: have no EA host. For them the terminal lives in the provider's cloud and we
+    #: read history over HTTPS. Empty token means the feature is simply switched off.
+    metaapi_token: str = ""
+    metaapi_provisioning_url: str = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai"
+    metaapi_client_url: str = "https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai"
+    #: How often a connected account is polled for new deals.
+    provider_poll_interval_sec: int = 300
+    #: Re-read this far back every poll. Brokers book swap and commission late, so a
+    #: closed trade's true cost keeps moving for days after the fill.
+    provider_overlap_hours: int = 48
+    #: How far back the first import reaches. Ten years covers any real account.
+    provider_backfill_years: int = 10
+
+    #: True on a platform that gives each request its own short-lived process
+    #: (Vercel and friends). Turns off connection pooling, which such a platform
+    #: punishes rather than rewards.
+    serverless: bool = False
+
+    #: Shared secret for the HTTP scheduler endpoints. Empty means they 404, which
+    #: is the right default: an open scheduler endpoint drives the database for free.
+    cron_secret: str = ""
+
     # ── observability ───────────────────────────────────────────────────────
     sentry_dsn: str = ""
     prometheus_enabled: bool = True

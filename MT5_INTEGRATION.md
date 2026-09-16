@@ -116,6 +116,35 @@ you hand a third party both your uptime and your users' credentials.
 All four emit the same `RawDeal` objects into the same ingest contract. Then Tier 4 is
 a 200-line file you can add on a Sunday afternoon, not a rewrite.
 
+### Built, and not for the reason above
+
+Tier 4 shipped early, because the rollout table below missed something: **MetaTrader
+on iPhone and iPad cannot run an Expert Advisor at all.** It is a desktop-only
+feature. A trader who works from a tablet — which is a lot of them — has no machine
+of their own that can do the reading, so Tier 1 is not "the default" for them, it is
+impossible. That is a reason to have Tier 4 on day one and has nothing to do with
+account counts.
+
+How it is wired:
+
+| Piece | Where |
+|---|---|
+| The interface | `backend/app/adapters/history_provider.py` |
+| MetaApi over REST | `backend/app/adapters/metaapi.py` |
+| Connect, poll, disconnect | `backend/app/services/provider_sync.py` |
+| HTTP | `POST /accounts/{id}/connect`, `POST /accounts/{id}/sync`, `DELETE /accounts/{id}/connect` |
+| Scheduling | `poll_providers` (arq cron, or `GET /api/v1/cron/tick` on a serverless host) |
+
+REST rather than the vendor SDK: the SDK opens persistent websockets and holds
+history in memory, neither of which survives a serverless function. Plain HTTPS calls
+do, and the polling interval is `PROVIDER_POLL_INTERVAL_SEC` rather than a cron
+expression, so changing it is a setting.
+
+**No password is stored.** The investor password goes to the provider during
+`connect` and is never written to our database — all we keep is an opaque
+`provider_account_id`. If the trader changes it, they re-enter it; there is nothing
+of theirs for us to lose.
+
 ---
 
 ## Recommended rollout

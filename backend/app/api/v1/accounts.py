@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Request, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field, SecretStr
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,7 +14,7 @@ from app.core import crypto
 from app.core.db import get_session
 from app.core.security import UserPrincipal
 from app.models import Account, EaInstallation, RawDeal, SyncRun, Trade
-from app.services import audit, rebuild
+from app.services import audit, provider_sync, rebuild
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 
@@ -26,6 +27,24 @@ class AccountIn(BaseModel):
     broker_server: str | None = Field(default=None, max_length=120)
     currency: str = Field(default="USD", max_length=3)
     starting_balance: str | None = None
+    #: How the trader intends to connect. Recorded now so the account card can show
+    #: the right next step before either connection actually exists.
+    sync_source: Literal["ea", "cloud"] = "ea"
+
+
+class ConnectIn(BaseModel):
+    """Connect an account whose terminal we host in the cloud.
+
+    Only an investor password is accepted. It is passed straight to the provider and
+    never stored, logged or echoed back -- SecretStr keeps it out of tracebacks and
+    validation errors too.
+    """
+
+    mt5_login: int = Field(gt=0)
+    broker_server: str = Field(min_length=1, max_length=120)
+    investor_password: SecretStr = Field(min_length=1, max_length=256)
+    broker_name: str | None = Field(default=None, max_length=120)
+    margin_mode: str | None = Field(default=None, pattern="^(hedging|netting)$")
 
 
 class AccountPatch(BaseModel):
@@ -76,6 +95,9 @@ async def _serialize(db: AsyncSession, account: Account) -> dict:
         "open_positions": account.open_positions,
         "last_heartbeat_at": account.last_heartbeat_at,
         "connected": _connected(account),
+        "provider": account.provider,
+        "provider_state": account.provider_state,
+        "provider_synced_at": account.provider_synced_at,
         "sync_status": account.sync_status,
         "sync_error": account.sync_error,
         "deal_count": deals,
@@ -127,21 +149,26 @@ async def create_account(
         currency=payload.currency,
         starting_balance=Decimal(payload.starting_balance)
         if payload.starting_balance else None,
+        sync_source=payload.sync_source,
     )
     db.add(account)
     await db.flush()
 
-    code = crypto.generate_install_code()
-    db.add(
-        EaInstallation(
-            account_id=account.id,
-            install_code=code,
-            install_code_expires_at=datetime.now(UTC) + timedelta(hours=48),
-            api_key_id="ea_" + crypto.generate_secret(12),
-            api_secret_hash="",
-            status="PENDING",
+    # Only the Expert Advisor path needs a code. A cloud-read account gets one on
+    # request instead, so nobody is handed a credential they were never going to use.
+    code = None
+    if payload.sync_source == "ea":
+        code = crypto.generate_install_code()
+        db.add(
+            EaInstallation(
+                account_id=account.id,
+                install_code=code,
+                install_code_expires_at=datetime.now(UTC) + timedelta(hours=48),
+                api_key_id="ea_" + crypto.generate_secret(12),
+                api_secret_hash="",
+                status="PENDING",
+            )
         )
-    )
     await audit.record(
         db, action="ACCOUNT_CREATED", actor_user_id=principal.user_id,
         entity_type="account", entity_id=str(account.id), request=request,
@@ -223,6 +250,87 @@ async def reissue_install_code(
     )
     await db.commit()
     return {"install_code": code, "expires_in_hours": 48}
+
+
+@router.post("/{account_id}/connect")
+async def connect_account(
+    payload: ConnectIn,
+    request: Request,
+    account: Account = Depends(owned_account),
+    principal: UserPrincipal = Depends(current_principal),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    """Connect a cloud-hosted terminal using a read-only investor password.
+
+    For traders with no Windows machine to run the EA on -- which includes anyone
+    working from an iPad, where MetaTrader cannot host an Expert Advisor at all.
+    """
+    if payload.margin_mode:
+        account.margin_mode = payload.margin_mode
+    if payload.broker_name:
+        account.broker_name = payload.broker_name
+
+    try:
+        await provider_sync.connect(
+            db,
+            account,
+            login=payload.mt5_login,
+            server=payload.broker_server.strip(),
+            investor_password=payload.investor_password.get_secret_value(),
+        )
+    except provider_sync.ProviderSyncError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+
+    await audit.record(
+        db, action="ACCOUNT_CLOUD_CONNECTED", actor_user_id=principal.user_id,
+        entity_type="account", entity_id=str(account.id),
+        # login and server only -- the password is not ours to record.
+        after={"login": payload.mt5_login, "server": payload.broker_server},
+        request=request,
+    )
+    await db.commit()
+    return await _serialize(db, account)
+
+
+@router.delete("/{account_id}/connect")
+async def disconnect_account(
+    request: Request,
+    account: Account = Depends(owned_account),
+    principal: UserPrincipal = Depends(current_principal),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    """Stop reading the account. The imported history stays."""
+    await provider_sync.disconnect(db, account)
+    await audit.record(
+        db, action="ACCOUNT_CLOUD_DISCONNECTED", actor_user_id=principal.user_id,
+        entity_type="account", entity_id=str(account.id), request=request,
+    )
+    await db.commit()
+    return await _serialize(db, account)
+
+
+@router.post("/{account_id}/sync")
+async def sync_now(
+    account: Account = Depends(owned_account),
+    db: AsyncSession = Depends(get_session),
+    full: bool = False,
+) -> dict:
+    """Read the account now instead of waiting for the next poll.
+
+    `full=true` re-reads the whole history. Always safe: deals are deduplicated on
+    the broker's own ticket, so a re-read cannot double-count anything.
+    """
+    try:
+        result = await provider_sync.sync_account(db, account, full=full)
+    except provider_sync.ProviderSyncError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+
+    result["trades_built"] = await rebuild.rebuild_account(db, account)
+    return result
 
 
 @router.post("/{account_id}/rebuild")

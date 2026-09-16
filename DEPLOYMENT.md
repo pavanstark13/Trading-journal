@@ -41,6 +41,66 @@ it should stay that way.
 6–8 portable MT5 installs, one Python service, auto-restart on crash via NSSM or a
 scheduled task. Treat it as cattle — a documented rebuild script beats a pet you fix.
 
+## 2b. Deploying on Vercel (no server to look after)
+
+Everything runs on Vercel with two projects from this one repository.
+
+| Project | Root directory | Framework |
+|---|---|---|
+| `journal-web` | `web` | Next.js — detected, no configuration needed |
+| `journal-api` | `backend` | Python — uses `backend/vercel.json` |
+
+The API's `backend/api/index.py` imports the same `app` that `uvicorn` serves, so
+there is one codebase, not a serverless fork of it.
+
+**What has to change, and why.** Vercel has nowhere for a process to live between
+requests, which breaks two things the VPS deployment relies on:
+
+- *The arq worker.* `GET /api/v1/cron/tick` runs the same functions over HTTP, and
+  `backend/vercel.json` has Vercel call it on a schedule. Both can run at once
+  safely: every task claims its work in the database, so whichever arrives first
+  does it.
+- *Connection pooling.* Set `SERVERLESS=true` and the application keeps no pool of
+  its own — a hundred short-lived functions each holding ten connections would
+  exhaust Postgres. Use your provider's **pooled** connection string.
+
+Managed pieces to point it at:
+
+| Need | Service | Note |
+|---|---|---|
+| Postgres | Neon | use the `-pooler` host in `DATABASE_URL` |
+| Redis | Upstash | rate limits, nonces, the live-update channel |
+| MetaTrader access | MetaApi | free for one account |
+
+Environment variables, on the API project:
+
+```
+DATABASE_URL=postgresql+asyncpg://…-pooler…/journal
+REDIS_URL=rediss://…upstash.io:6379
+SERVERLESS=true
+ENV=production
+JWT_SECRET=…                 # 32+ random bytes
+MASTER_ENCRYPTION_KEY=…      # 32+ random bytes, never rotated casually
+CRON_SECRET=…                # Vercel sends this as a bearer token
+METAAPI_TOKEN=…
+FRONTEND_ORIGIN=https://your-domain
+ENABLE_DOCS=false
+```
+
+and on the web project, `NEXT_PUBLIC_API_BASE_URL=https://api.your-domain`.
+
+`CRON_SECRET` is not optional. With it unset the scheduler endpoints return 404
+rather than running: an endpoint anyone can call is a free way to drive the database.
+
+Migrations do not run themselves here — there is no entrypoint to hang them off.
+Run `alembic upgrade head` against the **direct** (not pooled) connection string
+before promoting a deployment.
+
+**The honest trade-off.** Vercel costs more per month than the €13 VPS above and
+polls on a schedule rather than reacting in seconds. What it buys is that nobody has
+to patch, monitor or restart a server. For one trader and a handful of friends, that
+is usually the right trade.
+
 ## 3. Monthly cost
 
 | Item | MVP (Tiers 1+3) | With Tier 2 |
