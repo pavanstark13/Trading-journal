@@ -15,6 +15,9 @@ from app.services import provider_sync, rebuild
 
 log = get_logger(__name__)
 
+#: Start warning about the provider token this many days before it expires.
+TOKEN_WARNING_DAYS = 7
+
 
 async def broadcast(event_type: str, data: dict) -> None:
     """Publish to the live-update channel. Never process memory, so a second API
@@ -119,6 +122,36 @@ async def refresh_provisional(_ctx: dict | None = None) -> int:
         return result.rowcount or 0
 
 
+def _provider_access_status() -> str | None:
+    """Whether the journal can still reach the provider tomorrow.
+
+    MetaApi's default token lasts a week and nobody remembers that a week later. An
+    expired one stops every cloud account importing at once, with nothing on screen
+    explaining why -- so it is said out loud here while there is still time to act.
+    """
+    if not settings.metaapi_token:
+        return None
+
+    from app.adapters.metaapi import token_expires_at
+
+    expiry = token_expires_at(settings.metaapi_token)
+    if expiry is None:
+        return "ONLINE"
+
+    days_left = (expiry - datetime.now(UTC)).total_seconds() / 86400
+    if days_left <= 0:
+        log.error("provider.access_expired", expired_at=expiry.isoformat())
+        return "OFFLINE"
+    if days_left <= TOKEN_WARNING_DAYS:
+        log.warning(
+            "provider.access_expiring",
+            expires_at=expiry.isoformat(),
+            days_left=round(days_left, 1),
+        )
+        return "WARNING"
+    return "ONLINE"
+
+
 async def health_sweep(_ctx: dict | None = None) -> dict[str, str]:
     statuses: dict[str, str] = {}
     async with SessionLocal() as db:
@@ -132,6 +165,10 @@ async def health_sweep(_ctx: dict | None = None) -> dict[str, str]:
             statuses["redis"] = "ONLINE"
         except Exception:
             statuses["redis"] = "OFFLINE"
+
+        access = _provider_access_status()
+        if access is not None:
+            statuses["provider_access"] = access
 
         pending = (
             await db.execute(

@@ -13,7 +13,9 @@ them and this should be a settings change rather than a code change.
 """
 from __future__ import annotations
 
-from datetime import datetime
+import base64
+import json
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -23,6 +25,27 @@ from app.core.config import settings
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
+
+
+def token_expires_at(token: str) -> datetime | None:
+    """When the configured token stops working, read from the token itself.
+
+    The signature is not checked, and does not need to be: this is our own
+    configuration value and the answer is only used to warn an operator. Nothing is
+    authorised on the strength of it -- the provider still decides that.
+
+    Worth doing because MetaApi's default token lifetime is a week. A token that
+    quietly expires means every account stops importing with no obvious cause, which
+    a trader would read as "the journal is broken".
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return datetime.fromtimestamp(int(claims["exp"]), UTC)
+    except Exception:
+        # A token we cannot read has no known expiry, which is not an error here.
+        return None
 
 
 class MetaApiError(Exception):
@@ -55,16 +78,35 @@ class MetaApiProvider:
             await self._client.aclose()
 
     @property
+    def expires_at(self) -> datetime | None:
+        return token_expires_at(self._token) if self._token else None
+
+    @property
     def _headers(self) -> dict[str, str]:
         if not self._token:
             raise MetaApiError("METAAPI_TOKEN is not configured")
+        expiry = self.expires_at
+        if expiry is not None and expiry <= datetime.now(UTC):
+            # Fail here with the real reason rather than letting the provider answer
+            # 401, which reads as "wrong password" and sends the trader hunting.
+            raise MetaApiError(
+                f"The MetaApi token expired on {expiry:%d %B %Y}. Issue a new one and "
+                "set METAAPI_TOKEN; no account can import until then."
+            )
         return {"auth-token": self._token, "Content-Type": "application/json"}
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         try:
             response = await self._client.request(method, url, headers=self._headers, **kwargs)
         except httpx.HTTPError as exc:
-            raise MetaApiError(f"network error: {exc}", retryable=True) from exc
+            # Whatever the transport said, the trader's question is "is it my fault?".
+            # The answer is no, so say that and keep the detail for the log.
+            log.warning("metaapi.transport_error", error=str(exc), url=url)
+            raise MetaApiError(
+                "Could not reach the service that reads your account. Nothing is wrong "
+                "with your login details, and it will keep trying.",
+                retryable=True,
+            ) from exc
 
         if response.status_code == 429:
             raise MetaApiError("rate limited", status=429, retryable=True)

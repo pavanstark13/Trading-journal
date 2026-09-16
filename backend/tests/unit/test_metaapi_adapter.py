@@ -6,7 +6,7 @@ confidently is dropped rather than guessed at.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -169,3 +169,68 @@ async def test_a_missing_token_is_a_configuration_error_not_a_crash() -> None:
     async with MetaApiProvider(token="") as provider:
         with pytest.raises(MetaApiError, match="METAAPI_TOKEN"):
             await provider.status(ProviderHandle(provider_account_id="acc-1", state="X"))
+
+
+# ── the token's own expiry ───────────────────────────────────────────────────────
+def _token(exp: int) -> str:
+    """A JWT-shaped string with the claims we read. The signature is never checked."""
+    import base64
+    import json
+
+    def part(obj: dict) -> str:
+        raw = base64.urlsafe_b64encode(json.dumps(obj).encode()).decode()
+        return raw.rstrip("=")
+
+    return f"{part({'alg': 'RS512'})}.{part({'exp': exp})}.not-a-real-signature"
+
+
+def test_the_tokens_expiry_is_read_from_the_token() -> None:
+    from app.adapters.metaapi import token_expires_at
+
+    when = datetime(2026, 9, 23, 14, 6, 15, tzinfo=UTC)
+    assert token_expires_at(_token(int(when.timestamp()))) == when
+
+
+def test_an_unreadable_token_simply_has_no_known_expiry() -> None:
+    from app.adapters.metaapi import token_expires_at
+
+    assert token_expires_at("not-a-jwt") is None
+    assert token_expires_at("") is None
+
+
+async def test_an_expired_token_says_so_rather_than_looking_like_a_bad_password() -> None:
+    """A provider 401 reads as 'wrong password' and sends the trader hunting."""
+    yesterday = datetime.now(UTC) - timedelta(days=1)
+    async with MetaApiProvider(token=_token(int(yesterday.timestamp()))) as provider:
+        with pytest.raises(MetaApiError, match="expired"):
+            await provider.status(ProviderHandle(provider_account_id="acc-1", state="X"))
+
+
+def test_health_warns_before_the_token_expires_not_after() -> None:
+    from app.workers.tasks import _provider_access_status
+
+    def status_with(days: float) -> str | None:
+        expiry = datetime.now(UTC) + timedelta(days=days)
+        settings.metaapi_token = _token(int(expiry.timestamp()))
+        return _provider_access_status()
+
+    assert status_with(30) == "ONLINE"
+    assert status_with(3) == "WARNING"       # MetaApi's default token lasts 7 days
+    assert status_with(-1) == "OFFLINE"
+
+    settings.metaapi_token = ""
+    assert _provider_access_status() is None
+
+
+@respx.mock
+async def test_a_network_failure_does_not_read_as_the_traders_mistake() -> None:
+    """The card shows this text. "network error: 403 Forbidden" helps nobody."""
+    respx.get(f"{PROVISIONING}/users/current/accounts").mock(
+        side_effect=httpx.ConnectError("CONNECT tunnel failed, response 403")
+    )
+    async with MetaApiProvider() as provider:
+        with pytest.raises(MetaApiError) as exc:
+            await provider.provision(ACCOUNT, "x")
+
+    assert exc.value.retryable is True
+    assert "Nothing is wrong with your login details" in str(exc.value)
