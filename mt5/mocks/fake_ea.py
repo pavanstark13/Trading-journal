@@ -188,6 +188,18 @@ class FakeTerminal:
         return self._time_cursor
 
 
+def _digits_for(symbol: str) -> int:
+    """What a real broker reports. Metals and indices are not 5-digit quotes, and
+    getting this wrong turns a 21-dollar move in gold into "212,513 pips"."""
+    if not symbol:
+        return 5
+    if symbol.startswith(("XAU", "XAG")) or symbol.endswith(("US30", "NAS100", "SPX500")):
+        return 2
+    if "JPY" in symbol:
+        return 3
+    return 5
+
+
 def _deal(
     *, ticket: int, kind: str, entry: str, volume: float, price: float,
     position_id: int | None, symbol: str, time_msc: int, sl: float | None = None,
@@ -211,7 +223,7 @@ def _deal(
         "profit": profit,
         "fee": 0,
         "magic": 0,
-        "digits": 3 if "JPY" in symbol else 5,
+        "digits": _digits_for(symbol),
         "reason": reason,
         "comment": "",
     }
