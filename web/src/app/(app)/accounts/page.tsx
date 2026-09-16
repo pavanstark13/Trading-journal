@@ -445,12 +445,12 @@ function ConnectDialog({
 
       <Field
         label="Server name"
-        hint="Copy it exactly as MetaTrader shows it, e.g. MultiBank-Live. A single wrong character fails."
+        hint="In MetaTrader it is under your account name, like MEXAtlantic-Real or ICMarkets-Live02. Copy it exactly — one wrong character and nothing connects."
       >
         <Input
           value={server}
           onChange={(event) => setServer(event.target.value)}
-          placeholder="MultiBank-Live"
+          placeholder="BrokerName-Real"
           autoCapitalize="none"
           autoCorrect="off"
           spellCheck={false}
