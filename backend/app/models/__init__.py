@@ -1,19 +1,26 @@
-"""ORM models. One module so the whole schema reads top to bottom.
+"""ORM models for the trading journal.
 
-Conventions: UUID v7-ish primary keys generated in Python, NUMERIC for all money,
-timestamptz everywhere, and no MT5 credential column anywhere (SECURITY.md section 1).
+Three layers, deliberately separate:
+
+  facts    raw_deals        append-only, exactly what the broker reported
+  truth    trades           derived, fully rebuildable from raw_deals
+  meaning  journal_entries  written by the trader, never regenerated
+
+Rebuilding every trade from the facts must not touch a single journal entry, so
+journal rows key off a stable `trade_key` derived from broker data, not off a trade's
+surrogate id. See docs in DATABASE_SCHEMA.md.
 """
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
     ARRAY,
     BigInteger,
     Boolean,
-    CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -41,12 +48,13 @@ def _now() -> datetime:
 
 
 TS = DateTime(timezone=True)
-Money = Numeric(18, 2)
-Price = Numeric(18, 5)
-Volume = Numeric(12, 4)
+Money = Numeric(18, 2)      # cash, in the account's currency
+Price = Numeric(18, 5)      # prices and levels
+Volume = Numeric(12, 4)     # lots
+Ratio = Numeric(10, 3)      # R multiples and similar
 
 
-# ── identity ────────────────────────────────────────────────────────────────────
+# ── people ──────────────────────────────────────────────────────────────────────
 class User(Base):
     __tablename__ = "users"
 
@@ -54,11 +62,15 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(Text)
     full_name: Mapped[str | None] = mapped_column(String(200))
-    role: Mapped[str] = mapped_column(String(20), default="MEMBER")
+    role: Mapped[str] = mapped_column(String(20), default="MEMBER")   # ADMIN | MEMBER
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     totp_secret_enc: Mapped[bytes | None] = mapped_column(LargeBinary)
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: Everything is stored in UTC; this is only used to bucket stats by the trader's
+    #: own clock. "I trade badly after lunch" is a statement about their afternoon.
     timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    #: Session windows for the session breakdown, as {"london": ["07:00","16:00"], ...}
+    session_windows: Mapped[dict | None] = mapped_column(JSONB)
     last_login_at: Mapped[datetime | None] = mapped_column(TS)
     failed_logins: Mapped[int] = mapped_column(SmallInteger, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(TS)
@@ -82,78 +94,53 @@ class Session(Base):
     created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
 
-# ── accounts ────────────────────────────────────────────────────────────────────
-class MasterAccount(Base):
-    __tablename__ = "master_accounts"
-    __table_args__ = (UniqueConstraint("mt5_login", "broker_server"),)
+# ── connected MT5 accounts ──────────────────────────────────────────────────────
+class Account(Base):
+    """One MT5 account belonging to one trader. Everything else hangs off this."""
+
+    __tablename__ = "accounts"
+    __table_args__ = (
+        UniqueConstraint("user_id", "mt5_login", "broker_server", name="uq_account_login"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
     label: Mapped[str] = mapped_column(String(100))
     mt5_login: Mapped[int] = mapped_column(BigInteger)
     broker_server: Mapped[str] = mapped_column(String(120))
+    broker_name: Mapped[str | None] = mapped_column(String(120))
     currency: Mapped[str] = mapped_column(String(3), default="USD")
     leverage: Mapped[int | None] = mapped_column(Integer)
+    #: 'hedging' or 'netting'. This decides how deals are grouped into trades, and
+    #: getting it wrong silently corrupts every statistic.
     margin_mode: Mapped[str] = mapped_column(String(10), default="hedging")
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    publish_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    copy_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    magic_filter: Mapped[list[int] | None] = mapped_column(ARRAY(BigInteger))
-    symbol_filter: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    #: 'ea' (terminal pushes) or 'report' (statement upload only)
+    sync_source: Mapped[str] = mapped_column(String(16), default="ea")
+    starting_balance: Mapped[Decimal | None] = mapped_column(Money)
     balance: Mapped[Decimal | None] = mapped_column(Money)
     equity: Mapped[Decimal | None] = mapped_column(Money)
-    margin: Mapped[Decimal | None] = mapped_column(Money)
-    free_margin: Mapped[Decimal | None] = mapped_column(Money)
     open_positions: Mapped[int | None] = mapped_column(Integer)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(TS)
-    last_event_at: Mapped[datetime | None] = mapped_column(TS)
-    created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
-
-
-class MemberAccount(Base):
-    __tablename__ = "member_accounts"
-    __table_args__ = (UniqueConstraint("mt5_login", "broker_server"),)
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
-    label: Mapped[str] = mapped_column(String(100))
-    mt5_login: Mapped[int] = mapped_column(BigInteger)
-    broker_server: Mapped[str] = mapped_column(String(120))
-    currency: Mapped[str] = mapped_column(String(3), default="USD")
-    leverage: Mapped[int | None] = mapped_column(Integer)
-    mode: Mapped[str] = mapped_column(String(10), default="LIVE")
-    status: Mapped[str] = mapped_column(String(20), default="ACTIVE", index=True)
-    balance: Mapped[Decimal | None] = mapped_column(Money)
-    equity: Mapped[Decimal | None] = mapped_column(Money)
-    free_margin: Mapped[Decimal | None] = mapped_column(Money)
-    open_positions: Mapped[int | None] = mapped_column(Integer)
-    realised_pl_today: Mapped[Decimal | None] = mapped_column(Money)
-    realised_pl_date: Mapped[datetime | None] = mapped_column(TS)
-    last_heartbeat_at: Mapped[datetime | None] = mapped_column(TS)
+    last_deal_time_msc: Mapped[int | None] = mapped_column(BigInteger)
+    sync_status: Mapped[str] = mapped_column(String(20), default="NEVER_SYNCED")
+    sync_error: Mapped[str | None] = mapped_column(Text)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
     user: Mapped[User] = relationship(lazy="joined")
-    copy_settings: Mapped[CopySettings | None] = relationship(
-        back_populates="member", lazy="selectin", uselist=False
-    )
-    risk_settings: Mapped[RiskSettings | None] = relationship(
-        back_populates="member", lazy="selectin", uselist=False
-    )
 
 
 class EaInstallation(Base):
+    """Credentials for one trader's terminal. No MT5 password is ever stored."""
+
     __tablename__ = "ea_installations"
-    __table_args__ = (
-        CheckConstraint("kind IN ('MASTER','MEMBER')", name="ck_ea_kind"),
-        Index("ix_ea_status_seen", "status", "last_seen_at"),
-    )
+    __table_args__ = (Index("ix_ea_status_seen", "status", "last_seen_at"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    kind: Mapped[str] = mapped_column(String(10))
-    master_account_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("master_accounts.id", ondelete="CASCADE")
-    )
-    member_account_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("member_accounts.id", ondelete="CASCADE")
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
     )
     install_code: Mapped[str | None] = mapped_column(String(32), unique=True)
     install_code_expires_at: Mapped[datetime | None] = mapped_column(TS)
@@ -161,9 +148,9 @@ class EaInstallation(Base):
     api_key_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     api_secret_hash: Mapped[str] = mapped_column(Text)
     api_secret_enc: Mapped[bytes | None] = mapped_column(LargeBinary)
-    secret_version: Mapped[int] = mapped_column(Integer, default=1)
     previous_secret_enc: Mapped[bytes | None] = mapped_column(LargeBinary)
     rotation_expires_at: Mapped[datetime | None] = mapped_column(TS)
+    secret_version: Mapped[int] = mapped_column(Integer, default=1)
     ea_version: Mapped[str | None] = mapped_column(String(32))
     terminal_build: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(20), default="PENDING")
@@ -173,48 +160,53 @@ class EaInstallation(Base):
     created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
 
-# ── trade events ────────────────────────────────────────────────────────────────
-class TradeEvent(Base):
-    __tablename__ = "trade_events"
+# ── FACTS: append-only, never updated ───────────────────────────────────────────
+class RawDeal(Base):
+    """Exactly what the broker reported. The black box recorder.
+
+    Never updated, never deleted. When the reconstruction logic has a bug -- and it
+    will -- it is fixed and re-run over these rows, and every affected trade heals.
+    """
+
+    __tablename__ = "raw_deals"
     __table_args__ = (
-        UniqueConstraint("master_account_id", "event_id", name="uq_trade_event_id"),
-        Index("ix_trade_events_account_time", "master_account_id", "occurred_at"),
-        Index("ix_trade_events_position", "position_id"),
-        Index("ix_trade_events_type_time", "event_type", "received_at"),
+        UniqueConstraint("account_id", "deal_ticket", name="uq_raw_deal"),
+        Index("ix_raw_deals_account_time", "account_id", "time_msc"),
+        Index("ix_raw_deals_position", "account_id", "position_id"),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    event_id: Mapped[str] = mapped_column(String(64))
-    master_account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("master_accounts.id"))
-    event_type: Mapped[str] = mapped_column(String(32))
-    ticket: Mapped[int | None] = mapped_column(BigInteger, index=True)
-    position_id: Mapped[int | None] = mapped_column(BigInteger)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"))
+    deal_ticket: Mapped[int] = mapped_column(BigInteger)
     order_ticket: Mapped[int | None] = mapped_column(BigInteger)
-    deal_ticket: Mapped[int | None] = mapped_column(BigInteger)
+    #: The grouping key on hedging accounts. On netting accounts it is far less useful
+    #: and the reconstruction runs a signed running-net state machine instead.
+    position_id: Mapped[int | None] = mapped_column(BigInteger)
+    time_msc: Mapped[int] = mapped_column(BigInteger)
+    type: Mapped[str] = mapped_column(String(16))        # buy|sell|balance|credit|…
+    entry: Mapped[str] = mapped_column(String(8))        # in|out|inout|out_by
     symbol: Mapped[str | None] = mapped_column(String(32))
-    side: Mapped[str | None] = mapped_column(String(4))
-    volume: Mapped[Decimal | None] = mapped_column(Volume)
-    price: Mapped[Decimal | None] = mapped_column(Price)
-    stop_loss: Mapped[Decimal | None] = mapped_column(Price)
-    take_profit: Mapped[Decimal | None] = mapped_column(Price)
-    prev_stop_loss: Mapped[Decimal | None] = mapped_column(Price)
-    prev_take_profit: Mapped[Decimal | None] = mapped_column(Price)
-    profit: Mapped[Decimal | None] = mapped_column(Money)
-    commission: Mapped[Decimal | None] = mapped_column(Money)
-    swap: Mapped[Decimal | None] = mapped_column(Money)
-    magic_number: Mapped[int | None] = mapped_column(BigInteger)
+    volume: Mapped[Decimal] = mapped_column(Volume, default=Decimal("0"))
+    price: Mapped[Decimal] = mapped_column(Price, default=Decimal("0"))
+    sl: Mapped[Decimal | None] = mapped_column(Price)
+    tp: Mapped[Decimal | None] = mapped_column(Price)
+    commission: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"))
+    swap: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"))
+    profit: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"))
+    fee: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"))
+    magic: Mapped[int | None] = mapped_column(BigInteger)
+    #: Price decimals for the symbol, as the terminal reports them. Needed to turn a
+    #: price difference into pips without guessing per instrument.
+    digits: Mapped[int] = mapped_column(SmallInteger, default=5)
+    reason: Mapped[str | None] = mapped_column(String(16))   # client|expert|sl|tp|so
     comment: Mapped[str | None] = mapped_column(Text)
-    server: Mapped[str | None] = mapped_column(String(120))
-    occurred_at: Mapped[datetime] = mapped_column(TS)
-    received_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
-    source_ea_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("ea_installations.id"))
-    raw_payload: Mapped[dict] = mapped_column(JSONB)
-    processing_status: Mapped[str] = mapped_column(String(20), default="RECEIVED", index=True)
-    ignore_reason: Mapped[str | None] = mapped_column(String(64))
+    payload: Mapped[dict] = mapped_column(JSONB)
+    source: Mapped[str] = mapped_column(String(16), default="ea")   # ea|report
+    ingested_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
 
 class Outbox(Base):
-    """Transactional outbox: written in the same transaction as the event."""
+    """Written in the same transaction as the deals, so nothing is lost or doubled."""
 
     __tablename__ = "outbox"
     __table_args__ = (Index("ix_outbox_pending", "dispatched_at", "id"),)
@@ -222,225 +214,220 @@ class Outbox(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     topic: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict] = mapped_column(JSONB)
-    trade_event_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("trade_events.id"))
+    account_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
     dispatched_at: Mapped[datetime | None] = mapped_column(TS)
     attempts: Mapped[int] = mapped_column(SmallInteger, default=0)
 
 
-class MasterTrade(Base):
-    __tablename__ = "master_trades"
-    __table_args__ = (UniqueConstraint("master_account_id", "position_id"),)
+# ── TRUTH: derived from the facts, fully rebuildable ────────────────────────────
+class Trade(Base):
+    """The trade a human thinks they took, reconstructed from atomic deals."""
+
+    __tablename__ = "trades"
+    __table_args__ = (
+        UniqueConstraint("account_id", "trade_key", name="uq_trade_key"),
+        Index("ix_trades_account_opened", "account_id", "opened_at"),
+        Index("ix_trades_symbol", "account_id", "symbol"),
+        Index("ix_trades_open", "account_id", "status"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    master_account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("master_accounts.id"))
-    position_id: Mapped[int] = mapped_column(BigInteger)
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"))
+    #: Stable identity derived from immutable broker data, so journal notes survive a
+    #: full rebuild. "h:<position_id>" on hedging, "n:<symbol>:<first deal>" on netting.
+    trade_key: Mapped[str] = mapped_column(String(80))
     symbol: Mapped[str] = mapped_column(String(32))
-    side: Mapped[str] = mapped_column(String(4))
-    status: Mapped[str] = mapped_column(String(10), default="OPEN")
-    volume_opened: Mapped[Decimal | None] = mapped_column(Volume)
-    volume_closed: Mapped[Decimal | None] = mapped_column(Volume, default=Decimal("0"))
-    open_price: Mapped[Decimal | None] = mapped_column(Price)
-    close_price: Mapped[Decimal | None] = mapped_column(Price)
-    stop_loss: Mapped[Decimal | None] = mapped_column(Price)
-    take_profit: Mapped[Decimal | None] = mapped_column(Price)
-    profit: Mapped[Decimal | None] = mapped_column(Money, default=Decimal("0"))
-    commission: Mapped[Decimal | None] = mapped_column(Money, default=Decimal("0"))
-    swap: Mapped[Decimal | None] = mapped_column(Money, default=Decimal("0"))
-    opened_at: Mapped[datetime | None] = mapped_column(TS)
+    direction: Mapped[str] = mapped_column(String(5))          # long | short
+    status: Mapped[str] = mapped_column(String(10))            # open | closed
+    opened_at: Mapped[datetime] = mapped_column(TS)
     closed_at: Mapped[datetime | None] = mapped_column(TS)
-    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
+
+    volume_opened: Mapped[Decimal] = mapped_column(Volume, default=Decimal("0"))
+    volume_closed: Mapped[Decimal] = mapped_column(Volume, default=Decimal("0"))
+    avg_entry_price: Mapped[Decimal | None] = mapped_column(Price)
+    avg_exit_price: Mapped[Decimal | None] = mapped_column(Price)
+    #: From the FIRST entry deal. This is the baseline every R multiple is measured
+    #: against, so it must never be overwritten by a later stop move.
+    initial_sl: Mapped[Decimal | None] = mapped_column(Price)
+    initial_tp: Mapped[Decimal | None] = mapped_column(Price)
+    final_sl: Mapped[Decimal | None] = mapped_column(Price)
+
+    gross_profit: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"))
+    commission: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"))
+    swap: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"))
+    fee: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"))
+    net_profit: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"))
+
+    risk_amount: Mapped[Decimal | None] = mapped_column(Money)
+    #: NULL when the trade had no stop. Never coerced to zero -- treating a no-stop
+    #: trade as 0R quietly corrupts expectancy.
+    r_multiple: Mapped[Decimal | None] = mapped_column(Ratio)
+    pips: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    exit_reason: Mapped[str | None] = mapped_column(String(20))   # tp|sl|manual|so
+
+    mae_price: Mapped[Decimal | None] = mapped_column(Price)
+    mfe_price: Mapped[Decimal | None] = mapped_column(Price)
+    mae_r: Mapped[Decimal | None] = mapped_column(Ratio)
+    mfe_r: Mapped[Decimal | None] = mapped_column(Ratio)
+
+    #: Bucketed in the trader's own timezone, not UTC.
+    session: Mapped[str | None] = mapped_column(String(16))
+    day_of_week: Mapped[int | None] = mapped_column(SmallInteger)
+    hour_of_day: Mapped[int | None] = mapped_column(SmallInteger)
+    trade_date: Mapped[date | None] = mapped_column(Date, index=True)
+
+    #: Brokers book swap and sometimes commission days later, so a closed trade's P/L
+    #: is not final immediately. Shown with a subtle badge rather than changed silently.
+    pl_provisional: Mapped[bool] = mapped_column(Boolean, default=True)
+    reconstruction_ver: Mapped[int] = mapped_column(Integer, default=1)
+    updated_at: Mapped[datetime] = mapped_column(TS, server_default=func.now(), onupdate=_now)
 
 
-# ── telegram ────────────────────────────────────────────────────────────────────
-class TelegramChannel(Base):
-    __tablename__ = "telegram_channels"
+class TradeLeg(Base):
+    """Which raw deals built this trade. The audit trail behind every number."""
+
+    __tablename__ = "trade_legs"
+    __table_args__ = (Index("ix_trade_legs_trade", "trade_id", "seq"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    trade_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("trades.id", ondelete="CASCADE"))
+    raw_deal_id: Mapped[int] = mapped_column(BigInteger)
+    deal_ticket: Mapped[int] = mapped_column(BigInteger)
+    leg_type: Mapped[str] = mapped_column(String(6))       # entry | exit
+    volume: Mapped[Decimal] = mapped_column(Volume)
+    price: Mapped[Decimal] = mapped_column(Price)
+    time_msc: Mapped[int] = mapped_column(BigInteger)
+    seq: Mapped[int] = mapped_column(Integer)
+
+
+# ── MEANING: written by the trader, never regenerated ───────────────────────────
+class JournalEntry(Base):
+    """The why. Keyed by trade_key so a full rebuild cannot orphan it."""
+
+    __tablename__ = "journal_entries"
+    __table_args__ = (
+        UniqueConstraint("account_id", "trade_key", name="uq_journal_trade"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    label: Mapped[str] = mapped_column(String(100))
-    bot_token_enc: Mapped[bytes] = mapped_column(LargeBinary)
-    chat_id: Mapped[str] = mapped_column(String(64))
-    master_account_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("master_accounts.id"))
-    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    message_template: Mapped[str | None] = mapped_column(Text)
-    publish_types: Mapped[list[str]] = mapped_column(
-        ARRAY(Text), default=lambda: ["TRADE_OPENED", "TRADE_MODIFIED", "TRADE_CLOSED"]
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"))
+    trade_key: Mapped[str] = mapped_column(String(80))
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+
+    thesis: Mapped[str | None] = mapped_column(Text)            # why I took it
+    execution_notes: Mapped[str | None] = mapped_column(Text)   # what actually happened
+    lesson: Mapped[str | None] = mapped_column(Text)
+    emotion: Mapped[str | None] = mapped_column(String(20))     # calm|fomo|revenge|…
+    confidence: Mapped[int | None] = mapped_column(SmallInteger)   # 1-5 at entry
+    followed_plan: Mapped[bool | None] = mapped_column(Boolean)
+    mistakes: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    #: Grades the PROCESS, not the outcome. A losing A-grade trade is a good trade.
+    grade: Mapped[str | None] = mapped_column(String(2))
+    setup_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("setups.id", ondelete="SET NULL")
     )
-    display_timezone: Mapped[str] = mapped_column(String(64), default="UTC")
-    edit_in_place: Mapped[bool] = mapped_column(Boolean, default=True)
-    last_ok_at: Mapped[datetime | None] = mapped_column(TS)
-    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TS, server_default=func.now(), onupdate=_now)
+
+
+class Setup(Base):
+    """A named strategy in the trader's playbook."""
+
+    __tablename__ = "setups"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_setup_name"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str | None] = mapped_column(Text)
+    checklist: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    color: Mapped[str | None] = mapped_column(String(16))
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
 
-class TelegramMessage(Base):
-    __tablename__ = "telegram_messages"
-    __table_args__ = (
-        UniqueConstraint("channel_id", "trade_event_id", name="uq_tg_channel_event"),
-        Index("ix_tg_retry", "status", "next_attempt_at"),
-    )
+class Tag(Base):
+    __tablename__ = "tags"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_tag_name"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    channel_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("telegram_channels.id", ondelete="CASCADE")
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
-    trade_event_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("trade_events.id", ondelete="CASCADE")
-    )
-    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
-    status: Mapped[str] = mapped_column(String(16), default="PENDING")
-    attempts: Mapped[int] = mapped_column(SmallInteger, default=0)
-    next_attempt_at: Mapped[datetime | None] = mapped_column(TS)
-    error: Mapped[str | None] = mapped_column(Text)
-    rendered_text: Mapped[str | None] = mapped_column(Text)
-    sent_at: Mapped[datetime | None] = mapped_column(TS)
-
-
-# ── copy engine ─────────────────────────────────────────────────────────────────
-class CopySettings(Base):
-    __tablename__ = "copy_settings"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    member_account_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("member_accounts.id", ondelete="CASCADE"), unique=True
-    )
-    copy_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    sizing_mode: Mapped[str] = mapped_column(String(32), default="BALANCE_PROPORTIONAL")
-    fixed_lot: Mapped[Decimal | None] = mapped_column(Volume)
-    copy_multiplier: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("1"))
-    risk_percent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
-    fixed_money_risk: Mapped[Decimal | None] = mapped_column(Money)
-    reverse_trades: Mapped[bool] = mapped_column(Boolean, default=False)
-    copy_sl: Mapped[bool] = mapped_column(Boolean, default=True)
-    copy_tp: Mapped[bool] = mapped_column(Boolean, default=True)
-    copy_modifications: Mapped[bool] = mapped_column(Boolean, default=True)
-    copy_pending: Mapped[bool] = mapped_column(Boolean, default=True)
-    symbol_map: Mapped[dict] = mapped_column(JSONB, default=dict)
-    max_signal_age_sec: Mapped[int] = mapped_column(Integer, default=60)
-    updated_at: Mapped[datetime] = mapped_column(TS, server_default=func.now(), onupdate=_now)
-
-    member: Mapped[MemberAccount] = relationship(back_populates="copy_settings")
-
-
-class RiskSettings(Base):
-    __tablename__ = "risk_settings"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    member_account_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("member_accounts.id", ondelete="CASCADE"), unique=True
-    )
-    max_daily_loss: Mapped[Decimal | None] = mapped_column(Money)
-    max_daily_loss_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
-    max_trade_risk: Mapped[Decimal | None] = mapped_column(Money)
-    max_lot: Mapped[Decimal | None] = mapped_column(Volume)
-    min_lot: Mapped[Decimal | None] = mapped_column(Volume)
-    max_simultaneous_trades: Mapped[int | None] = mapped_column(Integer)
-    max_daily_trades: Mapped[int | None] = mapped_column(Integer)
-    allowed_symbols: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
-    blocked_symbols: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
-    max_spread_points: Mapped[int | None] = mapped_column(Integer)
-    max_slippage_points: Mapped[int | None] = mapped_column(Integer, default=20)
-    trading_hours: Mapped[dict | None] = mapped_column(JSONB)
-    updated_at: Mapped[datetime] = mapped_column(TS, server_default=func.now(), onupdate=_now)
-
-    member: Mapped[MemberAccount] = relationship(back_populates="risk_settings")
-
-
-class CopyOrder(Base):
-    __tablename__ = "copy_orders"
-    __table_args__ = (
-        UniqueConstraint("trade_event_id", "member_account_id", name="uq_copy_event_member"),
-        Index("ix_copy_member_time", "member_account_id", "created_at"),
-        Index("ix_copy_status", "status"),
-        Index("ix_copy_lease", "lease_expires_at"),
-        Index("ix_copy_member_position", "member_account_id", "master_position_id"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    trade_event_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("trade_events.id", ondelete="CASCADE")
-    )
-    master_trade_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("master_trades.id"))
-    master_position_id: Mapped[int | None] = mapped_column(BigInteger)
-    member_account_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("member_accounts.id", ondelete="CASCADE")
-    )
-    action: Mapped[str] = mapped_column(String(20))
-    symbol: Mapped[str] = mapped_column(String(32))
-    side: Mapped[str | None] = mapped_column(String(4))
-    requested_lot: Mapped[Decimal | None] = mapped_column(Volume)
-    calculated_lot: Mapped[Decimal | None] = mapped_column(Volume)
-    final_lot: Mapped[Decimal | None] = mapped_column(Volume)
-    sizing_mode: Mapped[str | None] = mapped_column(String(32))
-    sizing_detail: Mapped[dict | None] = mapped_column(JSONB)
-    stop_loss: Mapped[Decimal | None] = mapped_column(Price)
-    take_profit: Mapped[Decimal | None] = mapped_column(Price)
-    master_price: Mapped[Decimal | None] = mapped_column(Price)
-    execution_price: Mapped[Decimal | None] = mapped_column(Price)
-    slippage_points: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
-    status: Mapped[str] = mapped_column(String(16), default="PENDING")
-    reject_reason: Mapped[str | None] = mapped_column(String(48))
-    reject_detail: Mapped[str | None] = mapped_column(Text)
-    broker_ticket: Mapped[int | None] = mapped_column(BigInteger)
-    broker_retcode: Mapped[int | None] = mapped_column(Integer)
-    execution_token: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
-    lease_expires_at: Mapped[datetime | None] = mapped_column(TS)
-    is_paper: Mapped[bool] = mapped_column(Boolean, default=False)
+    name: Mapped[str] = mapped_column(String(48))
+    color: Mapped[str | None] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
-    dispatched_at: Mapped[datetime | None] = mapped_column(TS)
-    executed_at: Mapped[datetime | None] = mapped_column(TS)
-    latency_ms: Mapped[int | None] = mapped_column(Integer)
 
 
-class SymbolSpec(Base):
-    """Broker contract specification, as reported by a member's own terminal.
+class TradeTag(Base):
+    """Also keyed by trade_key, for the same rebuild-safety reason as journal entries."""
 
-    Volume step is NOT 0.01 everywhere: XAUUSD, indices and crypto routinely use 0.1 or
-    1.0, and tick value differs per account currency. Guessing these is a live-money
-    bug, and risk-based sizing cannot be computed at all without tick value/size.
-    """
-
-    __tablename__ = "symbol_specs"
+    __tablename__ = "trade_tags"
     __table_args__ = (
-        UniqueConstraint("member_account_id", "symbol", name="uq_symbol_spec"),
+        UniqueConstraint("account_id", "trade_key", "tag_id", name="uq_trade_tag"),
+        Index("ix_trade_tags_lookup", "account_id", "trade_key"),
     )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"))
+    trade_key: Mapped[str] = mapped_column(String(80))
+    tag_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tags.id", ondelete="CASCADE"))
+
+
+class Screenshot(Base):
+    __tablename__ = "screenshots"
+    __table_args__ = (Index("ix_screenshots_lookup", "account_id", "trade_key"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    member_account_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("member_accounts.id", ondelete="CASCADE"), index=True
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"))
+    trade_key: Mapped[str] = mapped_column(String(80))
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    storage_key: Mapped[str] = mapped_column(String(512))
+    kind: Mapped[str] = mapped_column(String(12), default="entry")   # before|entry|exit|after
+    timeframe: Mapped[str | None] = mapped_column(String(8))
+    caption: Mapped[str | None] = mapped_column(Text)
+    content_type: Mapped[str] = mapped_column(String(64), default="image/png")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+
+
+class DailyNote(Base):
+    """Pre-market plan and post-market review, independent of any one trade."""
+
+    __tablename__ = "daily_notes"
+    __table_args__ = (UniqueConstraint("user_id", "note_date", name="uq_daily_note"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
-    symbol: Mapped[str] = mapped_column(String(32))
-    volume_min: Mapped[Decimal] = mapped_column(Volume)
-    volume_max: Mapped[Decimal] = mapped_column(Volume)
-    volume_step: Mapped[Decimal] = mapped_column(Volume)
-    tick_value: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
-    tick_size: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
-    contract_size: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
-    digits: Mapped[int] = mapped_column(SmallInteger, default=5)
-    trade_allowed: Mapped[bool] = mapped_column(Boolean, default=True)
+    note_date: Mapped[date] = mapped_column(Date)
+    pre_market: Mapped[str | None] = mapped_column(Text)
+    post_market: Mapped[str | None] = mapped_column(Text)
+    mood: Mapped[str | None] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TS, server_default=func.now(), onupdate=_now)
 
 
 # ── operations ──────────────────────────────────────────────────────────────────
-class ExecutionLog(Base):
-    __tablename__ = "execution_logs"
-    __table_args__ = (
-        Index("ix_exec_event", "trade_event_id", "at"),
-        Index("ix_exec_copy", "copy_order_id", "at"),
-    )
+class SyncRun(Base):
+    __tablename__ = "sync_runs"
+    __table_args__ = (Index("ix_sync_runs_account", "account_id", "started_at"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    trade_event_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("trade_events.id", ondelete="CASCADE")
-    )
-    copy_order_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("copy_orders.id", ondelete="CASCADE")
-    )
-    stage: Mapped[str] = mapped_column(String(32))
-    status: Mapped[str] = mapped_column(String(10))
-    message: Mapped[str | None] = mapped_column(Text)
-    meta: Mapped[dict | None] = mapped_column(JSONB)
-    at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"))
+    source: Mapped[str] = mapped_column(String(16))
+    started_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(TS)
+    deals_seen: Mapped[int] = mapped_column(Integer, default=0)
+    deals_new: Mapped[int] = mapped_column(Integer, default=0)
+    trades_built: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="RUNNING")
+    error: Mapped[str | None] = mapped_column(Text)
 
 
 class AuditLog(Base):
@@ -458,21 +445,6 @@ class AuditLog(Base):
     ip: Mapped[str | None] = mapped_column(String(45))
     user_agent: Mapped[str | None] = mapped_column(Text)
     at: Mapped[datetime] = mapped_column(TS, server_default=func.now(), index=True)
-
-
-class DeadLetterEvent(Base):
-    __tablename__ = "dead_letter_events"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    source: Mapped[str] = mapped_column(String(32))
-    ref_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    payload: Mapped[dict] = mapped_column(JSONB)
-    error: Mapped[str] = mapped_column(Text)
-    attempts: Mapped[int] = mapped_column(SmallInteger)
-    first_failed_at: Mapped[datetime] = mapped_column(TS)
-    last_failed_at: Mapped[datetime] = mapped_column(TS)
-    replayed_at: Mapped[datetime | None] = mapped_column(TS)
-    replayed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
 
 
 class Notification(Base):
@@ -499,41 +471,8 @@ class SystemHealth(Base):
     checked_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
 
-class SystemSettings(Base):
-    __tablename__ = "system_settings"
-    __table_args__ = (CheckConstraint("id = 1", name="ck_single_row"),)
-
-    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, default=1)
-    mode: Mapped[str] = mapped_column(String(10), default="LIVE")
-    copying_paused: Mapped[bool] = mapped_column(Boolean, default=False)
-    emergency_stop: Mapped[bool] = mapped_column(Boolean, default=False)
-    emergency_stop_at: Mapped[datetime | None] = mapped_column(TS)
-    emergency_stop_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
-    emergency_halts_telegram: Mapped[bool] = mapped_column(Boolean, default=False)
-    live_activated_at: Mapped[datetime | None] = mapped_column(TS)
-    live_activated_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
-    updated_at: Mapped[datetime] = mapped_column(TS, server_default=func.now(), onupdate=_now)
-
-
 __all__ = [
-    "AuditLog",
-    "CopyOrder",
-    "CopySettings",
-    "DeadLetterEvent",
-    "EaInstallation",
-    "ExecutionLog",
-    "MasterAccount",
-    "MasterTrade",
-    "MemberAccount",
-    "Notification",
-    "Outbox",
-    "RiskSettings",
-    "Session",
-    "SymbolSpec",
-    "SystemHealth",
-    "SystemSettings",
-    "TelegramChannel",
-    "TelegramMessage",
-    "TradeEvent",
-    "User",
+    "Account", "AuditLog", "DailyNote", "EaInstallation", "JournalEntry",
+    "Notification", "Outbox", "RawDeal", "Screenshot", "Session", "Setup",
+    "SyncRun", "SystemHealth", "Tag", "Trade", "TradeLeg", "TradeTag", "User",
 ]

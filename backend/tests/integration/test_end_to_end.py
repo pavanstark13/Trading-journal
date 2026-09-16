@@ -1,57 +1,37 @@
-"""The full loop, driven through real HTTP against the real app.
+"""The whole product, through real HTTP against the real app.
 
-    fake master EA -> POST /ea/master/events   (HMAC signed)
-                   -> outbox relay
-                   -> Telegram (mocked at the HTTP layer)
-                   -> copy planner + dispatcher
-                   -> fake member EA long-polls /ea/member/poll
-                   -> POST /ea/member/result
-                   -> dashboard timeline reflects every stage
+    sign up -> add an account -> terminal registers with the install code
+            -> uploads history -> trades appear -> write a note -> read the stats
 
-Nothing here is stubbed except the Telegram API itself. Registration, HMAC signing,
-replay rejection, idempotency, sizing, risk and lease handling are all the real code.
+Only MetaTrader is simulated, and the simulation speaks the same signed contract the
+real Expert Advisor speaks.
 """
 from __future__ import annotations
 
 import sys
-from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import httpx
 import pytest
-import respx
 from sqlalchemy import select
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from mt5.mocks.fake_ea import FakeEa
+from mt5.mocks.fake_ea import FakeTerminal, sample_history
 
 from app.core import crypto
 from app.core.db import get_session
+from app.core.security import Role, create_access_token
 from app.main import create_app
-from app.models import (
-    CopyOrder,
-    CopySettings,
-    EaInstallation,
-    ExecutionLog,
-    MasterAccount,
-    MemberAccount,
-    RiskSettings,
-    SystemSettings,
-    TelegramChannel,
-    TradeEvent,
-    User,
-)
+from app.models import Account, Trade, User
 from app.workers import tasks
 
-BOT_TOKEN = "123456789:AAFakeTokenForTestsOnly-abcdefghijklmno"
-TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+PASSWORD = "correct horse battery"
 
 
 @pytest.fixture
-async def app_client(db):
-    """The real ASGI app, wired to the test database session."""
+async def client(db):
     app = create_app()
 
     async def _override():
@@ -59,276 +39,235 @@ async def app_client(db):
 
     app.dependency_overrides[get_session] = _override
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
 
 
-async def _seed(db) -> tuple[str, str]:
-    """Create the accounts an admin would create, and return two install codes."""
-    master = MasterAccount(
-        label="MASTER-001",
-        mt5_login=5012345,
-        broker_server="MockBroker-Demo",
-        currency="USD",
-        balance=Decimal("10000"),
-        equity=Decimal("10000"),
-        last_heartbeat_at=datetime.now(UTC),
+@pytest.fixture
+async def trader(db):
+    user = User(
+        email="trader@example.com",
+        password_hash=crypto.hash_password(PASSWORD),
+        timezone="Europe/London",
+        role=Role.MEMBER,
     )
-    db.add(master)
-
-    user = User(email="e2e@example.com", password_hash=crypto.hash_password("x" * 12))
     db.add(user)
-    await db.flush()
-
-    member = MemberAccount(
-        user_id=user.id,
-        label="E2E Member",
-        mt5_login=7007007,
-        broker_server="MockBroker-Demo",
-        mode="LIVE",
-        status="ACTIVE",
-        balance=Decimal("2000"),
-        equity=Decimal("2000"),
-        free_margin=Decimal("1800"),
-        last_heartbeat_at=datetime.now(UTC),
-    )
-    db.add(member)
-    await db.flush()
-
-    db.add(
-        CopySettings(
-            member_account_id=member.id,
-            copy_enabled=True,
-            sizing_mode="BALANCE_PROPORTIONAL",
-            copy_multiplier=Decimal("1"),
-            max_signal_age_sec=300,
-        )
-    )
-    db.add(RiskSettings(member_account_id=member.id, max_slippage_points=20))
-
-    master_code = crypto.generate_install_code()
-    member_code = crypto.generate_install_code()
-    expiry = datetime.now(UTC) + timedelta(hours=24)
-
-    db.add(
-        EaInstallation(
-            kind="MASTER", master_account_id=master.id, install_code=master_code,
-            install_code_expires_at=expiry, api_key_id="ea_master_e2e",
-            api_secret_hash="", status="PENDING",
-        )
-    )
-    db.add(
-        EaInstallation(
-            kind="MEMBER", member_account_id=member.id, install_code=member_code,
-            install_code_expires_at=expiry, api_key_id="ea_member_e2e",
-            api_secret_hash="", status="PENDING",
-        )
-    )
-    db.add(SystemSettings(id=1, mode="LIVE", copying_paused=False, emergency_stop=False))
-    db.add(
-        TelegramChannel(
-            label="Signals",
-            bot_token_enc=crypto.encrypt(BOT_TOKEN),
-            chat_id="-1001234567890",
-            is_enabled=True,
-            publish_types=["TRADE_OPENED", "TRADE_MODIFIED", "TRADE_CLOSED"],
-        )
-    )
     await db.commit()
-    return master_code, member_code
+    await db.refresh(user)
+    return user
 
 
-@respx.mock
-async def test_master_trade_reaches_telegram_and_a_member_fill(db, app_client) -> None:
-    telegram = respx.post(TELEGRAM_URL).mock(
-        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 777}})
+def auth(user: User) -> dict[str, str]:
+    token, _ = create_access_token(user.id, Role(user.role))
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def test_a_trader_connects_an_account_and_sees_their_trades(db, client, trader) -> None:
+    headers = auth(trader)
+
+    # ── 1. add an account; the install code comes back in the same step ────────
+    created = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={"label": "My live account", "currency": "USD", "starting_balance": "10000"},
     )
-    master_code, member_code = await _seed(db)
+    assert created.status_code == 201
+    account_id = created.json()["id"]
+    install_code = created.json()["install_code"]
+    assert install_code
 
-    # ── 1. both EAs register with their one-time codes ─────────────────────────
-    master_ea = FakeEa(base_url="", kind="MASTER", mt5_login=5012345,
-                       broker_server="MockBroker-Demo",
-                       balance=10000.0, equity=10000.0)
-    member_ea = FakeEa(base_url="", kind="MEMBER", mt5_login=7007007,
-                       broker_server="MockBroker-Demo",
-                       balance=2000.0, equity=2000.0)
-    await master_ea.register(app_client, master_code)
-    await member_ea.register(app_client, member_code)
-    assert master_ea.api_secret and member_ea.api_secret
+    # ── 2. the terminal registers and uploads its history ─────────────────────
+    terminal = FakeTerminal(base_url="", margin_mode="hedging")
+    sample_history(terminal)
+    await terminal.register(client, install_code)
+    assert terminal.api_secret
 
-    # an install code is single use
+    # single use
     with pytest.raises(httpx.HTTPStatusError):
-        await FakeEa(base_url="", kind="MASTER", mt5_login=1).register(
-            app_client, master_code
-        )
+        await FakeTerminal(base_url="").register(client, install_code)
 
-    # ── 2. heartbeats ──────────────────────────────────────────────────────────
-    beat = await master_ea.heartbeat(app_client)
-    assert beat["mode"] == "LIVE"
-    assert beat["emergency_stop"] is False
-    await member_ea.heartbeat(app_client)
+    beat = await terminal.heartbeat(client)
+    assert beat["overlap_hours"] == 24
 
-    # ── 3. the master takes a trade ────────────────────────────────────────────
-    result = await master_ea.send_trade(
-        app_client, symbol="EURUSD", side="BUY", volume=0.50, price=1.17250,
-        stop_loss=1.17000, take_profit=1.17750, position_id=555001, deal_ticket=555002,
-    )
-    assert [r["status"] for r in result["results"]] == ["ACCEPTED"]
+    uploaded = await terminal.upload_history(client)
+    assert uploaded["accepted"] == len(terminal.history)
 
-    event = (await db.execute(select(TradeEvent))).scalars().one()
-    assert event.symbol == "EURUSD"
-
-    # ── 4. the worker relays the outbox: Telegram + copy planning ──────────────
+    # ── 3. the worker turns deals into trades ─────────────────────────────────
     assert await tasks.relay_outbox() == 1
-    assert await tasks.publish_telegram() == 1
 
-    assert telegram.called
-    posted = telegram.calls[0].request.content.decode()
-    assert "EURUSD" in posted and "1.17250" in posted and "OPENED" in posted
+    trades = (await db.execute(select(Trade))).scalars().all()
+    assert len(trades) == 8                       # the deposit is not a trade
 
-    order = (await db.execute(select(CopyOrder))).scalars().one()
-    assert order.status == "SENT"
-    assert order.final_lot == Decimal("0.10")      # 2,000 / 10,000 of 0.50 lots
+    # ── 4. the trade log shows them ───────────────────────────────────────────
+    listing = await client.get("/api/v1/trades", headers=headers)
+    assert listing.status_code == 200
+    body = listing.json()
+    assert body["total"] == 8
+    first = body["items"][0]
+    assert first["symbol"] in {"EURUSD", "GBPUSD", "XAUUSD", "USDJPY"}
+    assert first["has_journal"] is False          # nothing written up yet
 
-    # ── 5. the member EA long-polls and gets exactly one instruction ───────────
-    instructions = await member_ea.poll_once(app_client, wait=1)
-    assert len(instructions) == 1
-    instruction = instructions[0]
-    assert instruction["symbol"] == "EURUSD"
-    assert instruction["side"] == "BUY"
-    assert Decimal(instruction["lot"]) == Decimal("0.10")
-    assert instruction["client_tag"].startswith("TC-")
+    # ── 5. the account reports itself connected and synced ────────────────────
+    account = (await client.get(f"/api/v1/accounts/{account_id}", headers=headers)).json()
+    assert account["connected"] is True
+    assert account["margin_mode"] == "hedging"    # the terminal told us
+    assert account["broker_name"] == "Mock Broker Ltd"
+    assert account["deal_count"] == len(terminal.history)
+    assert account["trade_count"] == 8
 
-    # ── 6. it executes and reports back ────────────────────────────────────────
-    await member_ea.execute(app_client, instruction)
-
-    await db.refresh(order)
-    assert order.status == "EXECUTED"
-    assert order.broker_ticket is not None
-    assert order.latency_ms is not None
-
-    # ── 7. a second report with the same token is refused ──────────────────────
-    duplicate = await member_ea.post(
-        app_client, "/api/v1/ea/member/result",
-        {"execution_token": instruction["execution_token"], "status": "EXECUTED"},
+    # ── 6. write a note on one trade ──────────────────────────────────────────
+    trade_id = first["id"]
+    saved = await client.put(
+        f"/api/v1/trades/{trade_id}/journal",
+        headers=headers,
+        json={
+            "thesis": "London open, retest of the level",
+            "emotion": "calm",
+            "confidence": 4,
+            "followed_plan": True,
+            "grade": "A",
+            "mistakes": [],
+        },
     )
-    assert duplicate.status_code == 409
+    assert saved.status_code == 200
 
-    # ── 8. the timeline tells the whole story ──────────────────────────────────
-    stages = [
-        row.stage
-        for row in (
-            await db.execute(
-                select(ExecutionLog)
-                .where(ExecutionLog.trade_event_id == event.id)
-                .order_by(ExecutionLog.at)
-            )
-        ).scalars()
-    ]
-    for expected in (
-        "API_RECEIVED", "DB_STORED", "TELEGRAM_PUBLISHED",
-        "COPY_PLANNED", "COPY_DISPATCHED", "RESULT_RECEIVED",
-    ):
-        assert expected in stages, f"{expected} missing from {stages}"
+    detail = (await client.get(f"/api/v1/trades/{trade_id}", headers=headers)).json()
+    assert detail["journal"]["thesis"] == "London open, retest of the level"
+    assert detail["journal"]["grade"] == "A"
+    assert len(detail["legs"]) == 2               # every number traces to its deals
+
+    # ── 7. statistics ─────────────────────────────────────────────────────────
+    summary = (await client.get("/api/v1/stats/summary", headers=headers)).json()
+    assert summary["trades"] == 8
+    assert summary["wins"] == 5
+    assert summary["losses"] == 3
+    assert summary["sample_size"] == 8
+    assert summary["low_confidence"] is True      # 8 trades is not a sample
+
+    by_symbol = (
+        await client.get("/api/v1/stats/breakdown/symbol", headers=headers)
+    ).json()
+    assert {b["key"] for b in by_symbol["buckets"]} == {
+        "EURUSD", "GBPUSD", "XAUUSD", "USDJPY"
+    }
+
+    curves = (await client.get("/api/v1/stats/curves", headers=headers)).json()
+    assert curves["starting_balance"] == "10000.00"
+    assert len(curves["equity"]) == 8
+
+    overview = (await client.get("/api/v1/stats/overview", headers=headers)).json()
+    assert overview["summary"]["trades"] == 8
+    assert overview["behaviour"]["plan_adherence"]["followed"]["trades"] == 1
+
+    # ── 8. a rebuild keeps the note attached ──────────────────────────────────
+    rebuilt = await client.post(f"/api/v1/accounts/{account_id}/rebuild", headers=headers)
+    assert rebuilt.json()["trades_built"] == 8
+
+    refreshed = (await client.get("/api/v1/trades", headers=headers)).json()
+    journalled = [t for t in refreshed["items"] if t["has_journal"]]
+    assert len(journalled) == 1
 
 
-@respx.mock
-async def test_replayed_batch_produces_no_second_telegram_post(db, app_client) -> None:
-    """An EA restart replaying its spool must not double-post or double-copy."""
-    telegram = respx.post(TELEGRAM_URL).mock(
-        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+async def test_resyncing_the_same_history_changes_nothing(db, client, trader) -> None:
+    """The EA re-sends a 24-hour overlap on every sync, because brokers book swap late."""
+    headers = auth(trader)
+    created = await client.post(
+        "/api/v1/accounts", headers=headers, json={"label": "Account"}
     )
-    master_code, _ = await _seed(db)
-    ea = FakeEa(base_url="", kind="MASTER", mt5_login=5012345,
-                broker_server="MockBroker-Demo")
-    await ea.register(app_client, master_code)
+    install_code = created.json()["install_code"]
 
-    import time as _time
+    terminal = FakeTerminal(base_url="")
+    sample_history(terminal)
+    await terminal.register(client, install_code)
+    await terminal.upload_history(client)
+    await tasks.relay_outbox()
+    before = len((await db.execute(select(Trade))).scalars().all())
 
-    moment_ms = int(_time.time() * 1000)
-    first = await ea.send_trade(
-        app_client, position_id=999001, deal_ticket=999002, occurred_at_ms=moment_ms
-    )
-    assert first["results"][0]["status"] == "ACCEPTED"
+    again = await terminal.sync_recent(client, hours=24 * 365)
+    assert again["accepted"] == 0
+    assert again["duplicates"] == len(terminal.history)
 
     await tasks.relay_outbox()
-    await tasks.publish_telegram()
+    after = len((await db.execute(select(Trade))).scalars().all())
+    assert before == after == 8
 
-    # Same logical event, same deterministic id -- exactly what a spool replay sends.
-    second = await ea.send_trade(
-        app_client, position_id=999001, deal_ticket=999002, occurred_at_ms=moment_ms
-    )
-    assert second["results"][0]["status"] == "DUPLICATE"
 
+async def test_one_traders_trades_are_invisible_to_another(db, client, trader) -> None:
+    headers = auth(trader)
+    created = await client.post("/api/v1/accounts", headers=headers, json={"label": "Mine"})
+    terminal = FakeTerminal(base_url="")
+    sample_history(terminal)
+    await terminal.register(client, created.json()["install_code"])
+    await terminal.upload_history(client)
     await tasks.relay_outbox()
-    await tasks.publish_telegram()
 
-    assert telegram.call_count == 1
-    assert len((await db.execute(select(TradeEvent))).scalars().all()) == 1
-    assert len((await db.execute(select(CopyOrder))).scalars().all()) == 1
+    other = User(email="other@example.com", password_hash=crypto.hash_password(PASSWORD))
+    db.add(other)
+    await db.commit()
+    await db.refresh(other)
+
+    listing = (await client.get("/api/v1/trades", headers=auth(other))).json()
+    assert listing["total"] == 0
+
+    summary = (await client.get("/api/v1/stats/summary", headers=auth(other))).json()
+    assert summary["trades"] == 0
+
+    # And they cannot reach the account directly either.
+    account_id = created.json()["id"]
+    denied = await client.get(f"/api/v1/accounts/{account_id}", headers=auth(other))
+    assert denied.status_code == 404
 
 
-async def test_unsigned_and_tampered_requests_are_rejected(db, app_client) -> None:
-    master_code, _ = await _seed(db)
-    ea = FakeEa(base_url="", kind="MASTER", mt5_login=5012345,
-                broker_server="MockBroker-Demo")
-    await ea.register(app_client, master_code)
+async def test_unsigned_and_tampered_uploads_are_refused(db, client, trader) -> None:
+    headers = auth(trader)
+    created = await client.post("/api/v1/accounts", headers=headers, json={"label": "A"})
+    terminal = FakeTerminal(base_url="")
+    await terminal.register(client, created.json()["install_code"])
 
-    # no signature at all
-    bare = await app_client.post("/api/v1/ea/master/events", json={"events": []})
+    bare = await client.post("/api/v1/ea/deals", json={"deals": []})
     assert bare.status_code == 401
 
-    # valid headers, but the body was changed after signing
     import json as _json
 
-    body = _json.dumps({"server": "x", "events": []}, separators=(",", ":")).encode()
-    headers = ea._sign(body)
-    tampered = await app_client.post(
-        "/api/v1/ea/master/events", content=body.replace(b'"x"', b'"y"'), headers=headers
+    body = _json.dumps({"deals": []}, separators=(",", ":")).encode()
+    signed = terminal._sign(body)
+    tampered = await client.post(
+        "/api/v1/ea/deals", content=b'{"deals":[{"ticket":1}]}', headers=signed
     )
     assert tampered.status_code == 401
 
-    # A correctly signed request succeeds once; replaying it verbatim is refused,
-    # because the nonce has been consumed.
-    fresh_headers = ea._sign(body)
-    signed_ok = await app_client.post(
-        "/api/v1/ea/master/events", content=body, headers=fresh_headers
+
+async def test_login_and_read_your_own_trades(db, client, trader) -> None:
+    """The ordinary path a person takes: sign in, then look at the journal."""
+    login = await client.post(
+        "/api/v1/auth/login", json={"email": trader.email, "password": PASSWORD}
     )
-    replay = await app_client.post(
-        "/api/v1/ea/master/events", content=body, headers=fresh_headers
-    )
-    assert signed_ok.status_code in (200, 422)   # 422: empty events list
-    assert replay.status_code == 401
+    assert login.status_code == 200
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    me = await client.get("/api/v1/auth/me", headers=headers)
+    assert me.json()["email"] == trader.email
+
+    trades = await client.get("/api/v1/trades", headers=headers)
+    assert trades.status_code == 200
+    assert trades.json()["items"] == []
 
 
-@respx.mock
-async def test_emergency_stop_halts_the_member_ea(db, app_client) -> None:
-    respx.post(TELEGRAM_URL).mock(
-        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
-    )
-    master_code, member_code = await _seed(db)
-    master_ea = FakeEa(base_url="", kind="MASTER", mt5_login=5012345,
-                       broker_server="MockBroker-Demo")
-    member_ea = FakeEa(base_url="", kind="MEMBER", mt5_login=7007007,
-                       broker_server="MockBroker-Demo")
-    await master_ea.register(app_client, master_code)
-    await member_ea.register(app_client, member_code)
+async def test_netting_account_is_reconstructed_differently(db, client, trader) -> None:
+    headers = auth(trader)
+    created = await client.post("/api/v1/accounts", headers=headers, json={"label": "Net"})
 
-    system = await db.get(SystemSettings, 1)
-    system.emergency_stop = True
-    await db.commit()
-
-    # the heartbeat carries the flag, so the EA knows even with an empty queue
-    beat = await member_ea.heartbeat(app_client)
-    assert beat["emergency_stop"] is True
-
-    # and the poll refuses to hand out anything
-    response = await member_ea.get(app_client, "/api/v1/ea/member/poll?wait=1")
-    assert response.json()["halt"] is True
-
-    await master_ea.send_trade(app_client, position_id=444001, deal_ticket=444002)
+    terminal = FakeTerminal(base_url="", margin_mode="netting", mt5_login=900001)
+    terminal.deposit(5000)
+    terminal.round_trip(symbol="EURUSD", profit=25.0)
+    await terminal.register(client, created.json()["install_code"])
+    await terminal.upload_history(client)
     await tasks.relay_outbox()
 
-    order = (await db.execute(select(CopyOrder))).scalars().one()
-    assert order.status in ("CANCELLED", "REJECTED")
-    assert order.reject_reason == "EMERGENCY_STOP"
+    account = await db.get(Account, __import__("uuid").UUID(created.json()["id"]))
+    assert account.margin_mode == "netting"
+
+    trades = (await db.execute(select(Trade))).scalars().all()
+    assert len(trades) == 1
+    assert trades[0].net_profit == Decimal("24.30")   # profit plus the entry commission

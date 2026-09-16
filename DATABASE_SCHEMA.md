@@ -1,462 +1,266 @@
-# DATABASE_SCHEMA
+# 04 — Data Model & the Deal→Trade Reconstruction Algorithm
 
-PostgreSQL 16. UUID v7 primary keys (time-ordered → index locality) except where a
-broker-supplied natural key is better. All money is `NUMERIC`, never `float`. All
-timestamps are `timestamptz` stored in UTC.
+## 1. The mental model
 
-Migrations: Alembic, one revision per change, `alembic upgrade head` on container start.
+Three layers, and it matters that they stay separate:
+
+| Layer | Table | Mutability | Meaning |
+|---|---|---|---|
+| **Facts** | `raw_deals` | append-only, never updated | Exactly what the broker said happened |
+| **Truth** | `trades`, `trade_legs` | fully rebuildable from facts | The trade a human thinks they took |
+| **Meaning** | `journal_entries`, `tags`, `screenshots` | user-owned, never regenerated | Why they took it |
+
+The rebuild rule: **deleting every row in `trades` and re-running reconstruction must
+produce identical results, and must not touch a single journal entry.** Journal entries
+therefore key off a *stable* trade identity — see §5.
+
+## 2. Core schema (PostgreSQL 16)
+
+```sql
+-- ─── identity ────────────────────────────────────────────────────────────────
+users(id, email, name, timezone, created_at, role)          -- role: owner|member|trial
+subscriptions(id, user_id, plan, status, current_period_end, provider_ref)
+
+-- ─── connected accounts ──────────────────────────────────────────────────────
+accounts(
+  id, user_id, label,
+  broker_server, login, currency, leverage,
+  margin_mode          text NOT NULL,         -- 'hedging' | 'netting'  ← changes everything
+  sync_tier            text NOT NULL,         -- 'ea' | 'pool' | 'report' | 'metaapi'
+  ea_secret_enc        bytea,                 -- envelope-encrypted
+  investor_pw_enc      bytea,                 -- envelope-encrypted, Tier 2 only
+  dek_wrapped          bytea,                 -- per-account data key, wrapped by KMS
+  last_heartbeat_at, last_deal_time_msc, sync_status, sync_error,
+  starting_balance     numeric(18,2),
+  is_archived          boolean DEFAULT false
+)
+
+-- ─── FACTS: immutable ────────────────────────────────────────────────────────
+raw_deals(
+  id                bigserial PRIMARY KEY,
+  account_id        uuid NOT NULL,
+  deal_ticket       bigint NOT NULL,
+  order_ticket      bigint,
+  position_id       bigint,                   -- ★ grouping key on hedging accounts
+  time_msc          bigint NOT NULL,
+  type              text,                     -- buy|sell|balance|credit|correction|…
+  entry             text,                     -- in|out|inout|out_by
+  symbol            text,
+  volume            numeric(12,4),
+  price             numeric(18,5),
+  sl                numeric(18,5),
+  tp                numeric(18,5),
+  commission        numeric(18,2) DEFAULT 0,
+  swap              numeric(18,2) DEFAULT 0,
+  profit            numeric(18,2) DEFAULT 0,
+  fee               numeric(18,2) DEFAULT 0,
+  magic             bigint,
+  reason            text,                     -- client|expert|sl|tp|so|mobile|web
+  comment           text,
+  payload           jsonb NOT NULL,           -- the untouched original
+  ingested_at       timestamptz DEFAULT now(),
+  source            text,                     -- ea|pool|report|metaapi
+  UNIQUE (account_id, deal_ticket)            -- ★ the idempotency guarantee
+);
+CREATE INDEX ON raw_deals (account_id, time_msc);
+CREATE INDEX ON raw_deals (account_id, position_id);
+
+-- ─── TRUTH: derived, rebuildable ─────────────────────────────────────────────
+trades(
+  id                   uuid PRIMARY KEY,
+  account_id           uuid NOT NULL,
+  trade_key            text NOT NULL,         -- ★ stable identity, see §5
+  symbol               text NOT NULL,
+  direction            text NOT NULL,         -- long|short
+  status               text NOT NULL,         -- open|closed
+  opened_at            timestamptz NOT NULL,
+  closed_at            timestamptz,
+  volume_opened        numeric(12,4),
+  volume_closed        numeric(12,4),
+  avg_entry_price      numeric(18,5),
+  avg_exit_price       numeric(18,5),
+  initial_sl           numeric(18,5),         -- ★ from the FIRST entry deal → R baseline
+  initial_tp           numeric(18,5),
+  final_sl             numeric(18,5),
+  gross_profit         numeric(18,2),
+  commission           numeric(18,2),
+  swap                 numeric(18,2),
+  net_profit           numeric(18,2),         -- gross + commission + swap + fee
+  risk_amount          numeric(18,2),         -- |entry − initial_sl| × volume × tick_value
+  r_multiple           numeric(10,3),         -- net_profit / risk_amount  (NULL if no SL)
+  pips                 numeric(12,2),
+  duration_seconds     integer,
+  exit_reason          text,                  -- tp|sl|manual|so|partial_manual
+  mae_price            numeric(18,5),         -- enrichment, §6
+  mfe_price            numeric(18,5),
+  mae_r                numeric(10,3),
+  mfe_r                numeric(10,3),
+  session              text,                  -- asia|london|ny|overlap  (from opened_at)
+  day_of_week          smallint,
+  hour_of_day          smallint,              -- in the USER's timezone, not UTC
+  pl_provisional       boolean DEFAULT true,  -- late swap/commission window, doc 01 §3
+  reconstruction_ver   integer NOT NULL,
+  UNIQUE (account_id, trade_key)
+);
+
+trade_legs(                                   -- audit trail: which deals built this trade
+  id, trade_id, raw_deal_id, leg_type,        -- entry|exit
+  volume, price, time_msc, seq
+);
+
+-- ─── MEANING: user-owned, never regenerated ──────────────────────────────────
+journal_entries(
+  id, trade_id, user_id,
+  thesis              text,                   -- why I took it
+  execution_notes     text,                   -- what actually happened
+  lesson              text,
+  emotion             text,                   -- calm|fomo|revenge|hesitant|confident
+  confidence          smallint,               -- 1–5 at entry
+  followed_plan       boolean,
+  mistakes            text[],                 -- ['moved stop','no setup','oversized']
+  grade               text,                   -- A|B|C|D — grade the PROCESS, not the P/L
+  created_at, updated_at
+)
+setups(id, user_id, name, description, checklist jsonb)   -- the playbook
+trade_tags(trade_id, tag_id)  ·  tags(id, user_id, name, color, kind)
+screenshots(id, trade_id, url, kind, timeframe, caption)  -- kind: before|entry|exit|after
+daily_notes(id, user_id, date, pre_market, post_market, mood, screenshot_url)
+
+-- ─── ops ─────────────────────────────────────────────────────────────────────
+sync_runs(id, account_id, source, started_at, finished_at,
+          deals_seen, deals_new, trades_built, status, error)
+```
+
+### Money types
+`NUMERIC` everywhere, `Decimal` in Python, never `float`. A journal whose lifetime P/L
+disagrees with the sum of its trades by ₹0.03 loses the user's trust permanently.
+
+### Time
+Store UTC (`time_msc` as epoch ms — exactly what MT5 gives). Convert to the user's
+timezone **only at the presentation and bucketing layer**. `hour_of_day` and
+`day_of_week` are computed in user-local time, because "I trade badly after 2pm" is a
+statement about their afternoon, not UTC's.
 
 ---
 
-## 1. Identity & access
+## 3. Reconstruction, hedging accounts (the easy case)
 
-```sql
-users (
-  id                uuid PRIMARY KEY,
-  email             citext UNIQUE NOT NULL,
-  password_hash     text NOT NULL,              -- Argon2id
-  full_name         text,
-  role              text NOT NULL,              -- SUPER_ADMIN | ADMIN | MEMBER
-  is_active         boolean NOT NULL DEFAULT true,
-  totp_secret_enc   bytea,                      -- optional 2FA, encrypted
-  totp_enabled      boolean NOT NULL DEFAULT false,
-  timezone          text NOT NULL DEFAULT 'UTC',
-  last_login_at     timestamptz,
-  failed_logins     smallint NOT NULL DEFAULT 0,
-  locked_until      timestamptz,
-  created_at        timestamptz NOT NULL DEFAULT now(),
-  updated_at        timestamptz NOT NULL DEFAULT now()
-);
+On a hedging account every new deal opens its own position, and MT5 hands you
+`position_id` on each deal. Grouping is done for you.
 
--- Roles are an enum on users for v1 (3 fixed roles). The table exists so that
--- permission sets become data later without touching call sites.
-roles       (id uuid PK, name text UNIQUE, permissions jsonb NOT NULL DEFAULT '[]');
+```python
+def reconstruct_hedging(deals: list[RawDeal]) -> list[Trade]:
+    for position_id, group in group_by(deals, key=lambda d: d.position_id):
+        group.sort(key=lambda d: (d.time_msc, d.deal_ticket))
+        entries = [d for d in group if d.entry in ("in",)]
+        exits   = [d for d in group if d.entry in ("out", "out_by")]
 
-sessions (                                        -- refresh-token family
-  id                uuid PRIMARY KEY,
-  user_id           uuid NOT NULL REFERENCES users ON DELETE CASCADE,
-  refresh_hash      text NOT NULL,                -- sha256 of the token; never the token
-  family_id         uuid NOT NULL,                -- rotation lineage, for reuse detection
-  user_agent        text,
-  ip                inet,
-  expires_at        timestamptz NOT NULL,
-  revoked_at        timestamptz,
-  created_at        timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX ON sessions (user_id) WHERE revoked_at IS NULL;
-CREATE INDEX ON sessions (refresh_hash);
+        trade = Trade(
+            direction        = "long" if entries[0].type == "buy" else "short",
+            opened_at        = entries[0].time_msc,
+            initial_sl       = entries[0].sl or None,      # ★ first entry defines R
+            initial_tp       = entries[0].tp or None,
+            volume_opened    = sum(d.volume for d in entries),
+            avg_entry_price  = vwap(entries),
+            volume_closed    = sum(d.volume for d in exits),
+            avg_exit_price   = vwap(exits) if exits else None,
+            gross_profit     = sum(d.profit for d in group),
+            commission       = sum(d.commission for d in group),
+            swap             = sum(d.swap for d in group),
+            status           = "closed" if closed(entries, exits) else "open",
+        )
 ```
+
+`vwap` = Σ(price × volume) / Σ(volume). Always volume-weighted — a simple average of
+prices is wrong the moment the user scales in unevenly, which is exactly when it matters.
 
 ---
 
-## 2. Accounts
+## 4. Reconstruction, netting accounts (where everyone gets it wrong)
 
-```sql
-master_accounts (
-  id                uuid PRIMARY KEY,
-  label             text NOT NULL,
-  mt5_login         bigint NOT NULL,
-  broker_server     text NOT NULL,
-  currency          char(3) NOT NULL,
-  leverage          integer,
-  margin_mode       text NOT NULL DEFAULT 'hedging',   -- hedging | netting
-  is_active         boolean NOT NULL DEFAULT true,
-  publish_enabled   boolean NOT NULL DEFAULT true,
-  copy_enabled      boolean NOT NULL DEFAULT true,
-  magic_filter      bigint[],                     -- NULL = all; else only these magics
-  symbol_filter     text[],                       -- NULL = all
-  -- live telemetry from heartbeat
-  balance           numeric(18,2),
-  equity            numeric(18,2),
-  margin            numeric(18,2),
-  free_margin       numeric(18,2),
-  open_positions    integer,
-  last_heartbeat_at timestamptz,
-  last_event_at     timestamptz,
-  created_at        timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (mt5_login, broker_server)
-);
+On a netting account there is **one position per symbol**, period. A same-direction deal
+grows it; an opposite deal shrinks, closes, or **reverses** it. `position_id` is far less
+helpful. You must run a running-net state machine per symbol:
 
-member_accounts (
-  id                uuid PRIMARY KEY,
-  user_id           uuid NOT NULL REFERENCES users ON DELETE RESTRICT,
-  label             text NOT NULL,
-  mt5_login         bigint NOT NULL,
-  broker_server     text NOT NULL,
-  currency          char(3) NOT NULL DEFAULT 'USD',
-  leverage          integer,
-  mode              text NOT NULL DEFAULT 'LIVE',     -- PAPER | LIVE
-  status            text NOT NULL DEFAULT 'ACTIVE',   -- ACTIVE | SUSPENDED | REVOKED
-  -- live telemetry
-  balance           numeric(18,2),
-  equity            numeric(18,2),
-  free_margin       numeric(18,2),
-  open_positions    integer,
-  realised_pl_today numeric(18,2),        -- reported by the member's own terminal
-  realised_pl_date  timestamptz,          -- the day that figure belongs to
-  last_heartbeat_at timestamptz,
-  created_at        timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (mt5_login, broker_server)
-);
--- NOTE: no password column exists anywhere. MT5 credentials never reach this system.
-CREATE INDEX ON member_accounts (user_id);
-CREATE INDEX ON member_accounts (status) WHERE status = 'ACTIVE';
+```python
+def reconstruct_netting(deals, symbol):
+    net = Decimal(0)          # signed: + long, − short
+    open_trade = None
+    for d in sorted(deals, key=lambda d: (d.time_msc, d.deal_ticket)):
+        signed = d.volume if d.type == "buy" else -d.volume
+
+        if net == 0:                            # flat → this opens a new trade
+            open_trade = new_trade(d)
+
+        elif same_sign(net, signed):            # scaling in
+            open_trade.add_entry(d)
+
+        else:                                   # reducing / closing / reversing
+            closing = min(abs(net), abs(signed))
+            open_trade.add_exit(d, volume=closing)
+
+            if abs(signed) > abs(net):
+                # ★ DEAL_ENTRY_INOUT — a reversal. ONE deal, TWO trades.
+                finalize(open_trade)
+                open_trade = new_trade(d, volume=abs(signed) - abs(net))
+
+        net += signed
+        if net == 0:
+            finalize(open_trade); open_trade = None
 ```
 
----
+Three traps, all of which produce silently wrong statistics:
 
-## 3. EA installations (the auth boundary for terminals)
+1. **`DEAL_ENTRY_INOUT` is one deal that both closes and opens.** If you treat it as a
+   single event you either lose a trade or merge two unrelated ones. Split it, and
+   apportion `profit` to the closing part only.
+2. **Profit attribution on partial closes.** MT5 reports realized `profit` on the *exit*
+   deal. Never try to recompute it from prices — spread, swap and broker rounding will
+   make your number differ from the account statement, and the user will believe the
+   statement. **Trust the broker's `profit`, `commission`, `swap` fields.** Compute only
+   what the broker doesn't give you (R, pips, MAE/MFE).
+3. **Non-trade deals.** `DEAL_TYPE_BALANCE`, `CREDIT`, `CORRECTION`, `BONUS` are deposits
+   and adjustments, not trades. They must be excluded from trade stats but **included in
+   the equity curve** — otherwise a deposit looks like a winning trade.
 
-```sql
-ea_installations (
-  id                 uuid PRIMARY KEY,
-  kind               text NOT NULL,              -- MASTER | MEMBER
-  master_account_id  uuid REFERENCES master_accounts ON DELETE CASCADE,
-  member_account_id  uuid REFERENCES member_accounts ON DELETE CASCADE,
-  install_code       text UNIQUE,                -- one-time registration token
-  install_code_used_at timestamptz,
-  api_key_id         text UNIQUE NOT NULL,       -- public id sent in the header
-  api_secret_hash    text NOT NULL,              -- Argon2id of the HMAC secret
-  api_secret_enc     bytea,                      -- envelope-encrypted, for one-time re-reveal
-  secret_version     integer NOT NULL DEFAULT 1,
-  previous_secret_enc  bytea,                     -- accepted during a rotation grace window
-  rotation_expires_at  timestamptz,
-  ea_version         text,
-  terminal_build     integer,
-  status             text NOT NULL DEFAULT 'PENDING', -- PENDING|ACTIVE|REVOKED
-  last_seen_at       timestamptz,
-  last_seen_ip       inet,
-  revoked_at         timestamptz,
-  created_at         timestamptz NOT NULL DEFAULT now(),
-  CHECK ( (kind='MASTER') = (master_account_id IS NOT NULL) ),
-  CHECK ( (kind='MEMBER') = (member_account_id IS NOT NULL) )
-);
-CREATE INDEX ON ea_installations (api_key_id);
-CREATE INDEX ON ea_installations (status, last_seen_at);
+## 5. Stable trade identity (`trade_key`)
+
+Journal entries must survive a reconstruction rebuild. So `trades.id` may change, but
+`trade_key` must not:
+
+```
+hedging:  f"h:{position_id}"
+netting:  f"n:{symbol}:{first_entry_deal_ticket}"
 ```
 
----
+Both are derived from immutable broker facts. `journal_entries` joins via
+`(account_id, trade_key)`. Rebuild the world; the notes stay attached.
 
-## 4. Trade events (ingest, immutable)
+Bump `reconstruction_ver` when the algorithm changes, and in CI run the new version
+against golden fixtures and **print a diff of every changed trade** before you merge.
+That diff is your regression test and your changelog.
 
-```sql
-trade_events (
-  id                 uuid PRIMARY KEY,
-  event_id           text NOT NULL,              -- ★ deterministic, from the EA
-  master_account_id  uuid NOT NULL REFERENCES master_accounts,
-  event_type         text NOT NULL,              -- see enum below
-  ticket             bigint,
-  position_id        bigint,
-  order_ticket       bigint,
-  deal_ticket        bigint,
-  symbol             text,
-  side               text,                       -- BUY | SELL
-  volume             numeric(12,4),
-  price              numeric(18,5),
-  stop_loss          numeric(18,5),
-  take_profit        numeric(18,5),
-  prev_stop_loss     numeric(18,5),              -- for TRADE_MODIFIED diffs
-  prev_take_profit   numeric(18,5),
-  profit             numeric(18,2),
-  commission         numeric(18,2),
-  swap               numeric(18,2),
-  magic_number       bigint,
-  comment            text,
-  server             text,
-  occurred_at        timestamptz NOT NULL,       -- broker time of the transaction
-  received_at        timestamptz NOT NULL DEFAULT now(),
-  source_ea_id       uuid REFERENCES ea_installations,
-  raw_payload        jsonb NOT NULL,             -- untouched EA JSON, forever
-  processing_status  text NOT NULL DEFAULT 'RECEIVED',
-                     -- RECEIVED|STORED|QUEUED|PROCESSED|IGNORED|FAILED
-  ignore_reason      text,                       -- magic/symbol filter, duplicate, stale
-  UNIQUE (master_account_id, event_id)           -- ★ idempotency
-);
-CREATE INDEX ON trade_events (master_account_id, occurred_at DESC);
-CREATE INDEX ON trade_events (position_id);
-CREATE INDEX ON trade_events (ticket);
-CREATE INDEX ON trade_events (event_type, received_at DESC);
-CREATE INDEX ON trade_events (processing_status) WHERE processing_status <> 'PROCESSED';
+## 6. Enrichment (a second pass, after reconstruction)
+
+- **MAE / MFE** — Maximum Adverse / Favourable Excursion: the worst and best price the
+  trade ever saw while open. Requires M1 bars for `[opened_at, closed_at]`. Pull them
+  once via `copy_rates_range()` and cache per (symbol, day); a year of M1 for 20 symbols
+  is a few hundred MB, and it powers the single most actionable chart in the product
+  ("you exit at +0.8R on trades that go to +2.4R").
+- **Session** — bucket `opened_at` into Asia / London / NY / overlap using the user's
+  configured session times, not hardcoded UTC.
+- **Duration buckets** — scalp <5m, intraday <1d, swing >1d.
+- **R-multiple** — `net_profit / risk_amount`, where `risk_amount` comes from
+  `initial_sl`. If there was no stop, leave `r_multiple` NULL and **show it as "no stop"
+  in the UI rather than 0**. Quietly treating no-stop trades as 0R corrupts expectancy.
+
+## 7. Rebuild command
+
+```bash
+python -m app.cli rebuild --account <id> [--from 2024-01-01] [--dry-run]
+#   → recomputes trades from raw_deals
+#   → prints a diff table of changed fields
+#   → never touches journal_entries, tags, or screenshots
 ```
 
-**`event_type` values:** `TRADE_OPENED`, `TRADE_MODIFIED`, `TRADE_CLOSED`,
-`TRADE_PARTIAL_CLOSED`, `PENDING_ORDER_CREATED`, `PENDING_ORDER_MODIFIED`,
-`PENDING_ORDER_CANCELLED`, `PENDING_ORDER_TRIGGERED`.
-
-> `TRADE_PARTIAL_CLOSED` and `PENDING_ORDER_TRIGGERED` are additions to the brief's list.
-> Without them a scale-out is indistinguishable from a full close, and a triggered limit
-> order is invisible — both produce wrong copy behaviour.
-
-### 4.1 Transactional outbox
-
-```sql
-outbox (
-  id             bigserial PRIMARY KEY,
-  topic          text NOT NULL,                  -- trade.events | copy.results | ...
-  payload        jsonb NOT NULL,
-  trade_event_id uuid REFERENCES trade_events,
-  created_at     timestamptz NOT NULL DEFAULT now(),
-  dispatched_at  timestamptz,
-  attempts       smallint NOT NULL DEFAULT 0
-);
-CREATE INDEX ON outbox (dispatched_at, id) WHERE dispatched_at IS NULL;
-```
-
-### 4.2 Master trades (aggregated position view)
-
-```sql
-master_trades (
-  id                 uuid PRIMARY KEY,
-  master_account_id  uuid NOT NULL REFERENCES master_accounts,
-  position_id        bigint NOT NULL,
-  symbol             text NOT NULL,
-  side               text NOT NULL,
-  status             text NOT NULL,              -- OPEN | CLOSED
-  volume_opened      numeric(12,4),
-  volume_closed      numeric(12,4),
-  open_price         numeric(18,5),
-  close_price        numeric(18,5),
-  stop_loss          numeric(18,5),
-  take_profit        numeric(18,5),
-  profit             numeric(18,2),
-  commission         numeric(18,2),
-  swap              numeric(18,2),
-  opened_at          timestamptz,
-  closed_at          timestamptz,
-  telegram_message_id bigint,                    -- ← the live card that gets edited
-  UNIQUE (master_account_id, position_id)
-);
-```
-
----
-
-## 5. Telegram
-
-```sql
-telegram_channels (
-  id                 uuid PRIMARY KEY,
-  label              text NOT NULL,
-  bot_token_enc      bytea NOT NULL,             -- envelope-encrypted
-  chat_id            text NOT NULL,              -- @name or -100…
-  master_account_id  uuid REFERENCES master_accounts,
-  is_enabled         boolean NOT NULL DEFAULT true,
-  message_template   text,                       -- Jinja2; NULL = built-in default
-  publish_types      text[] NOT NULL DEFAULT '{TRADE_OPENED,TRADE_MODIFIED,TRADE_CLOSED}',
-  display_timezone   text NOT NULL DEFAULT 'UTC',
-  edit_in_place      boolean NOT NULL DEFAULT true,
-  last_ok_at         timestamptz,
-  last_error         text,
-  created_at         timestamptz NOT NULL DEFAULT now()
-);
-
-telegram_messages (
-  id                 uuid PRIMARY KEY,
-  channel_id         uuid NOT NULL REFERENCES telegram_channels ON DELETE CASCADE,
-  trade_event_id     uuid NOT NULL REFERENCES trade_events ON DELETE CASCADE,
-  telegram_message_id bigint,
-  status             text NOT NULL,              -- PENDING|SENT|EDITED|FAILED|DEAD
-  attempts           smallint NOT NULL DEFAULT 0,
-  next_attempt_at    timestamptz,
-  error              text,
-  rendered_text      text,
-  sent_at            timestamptz,
-  UNIQUE (channel_id, trade_event_id)            -- ★ never publish twice
-);
-CREATE INDEX ON telegram_messages (status, next_attempt_at) WHERE status IN ('PENDING','FAILED');
-```
-
----
-
-## 6. Copy engine
-
-```sql
-copy_settings (
-  id                 uuid PRIMARY KEY,
-  member_account_id  uuid UNIQUE NOT NULL REFERENCES member_accounts ON DELETE CASCADE,
-  copy_enabled       boolean NOT NULL DEFAULT false,
-  sizing_mode        text NOT NULL DEFAULT 'BALANCE_PROPORTIONAL',
-                     -- FIXED_LOT | LOT_MULTIPLIER | BALANCE_PROPORTIONAL
-                     -- | EQUITY_PROPORTIONAL | RISK_PERCENT | FIXED_MONEY_RISK
-  fixed_lot          numeric(12,4),
-  copy_multiplier    numeric(10,4) DEFAULT 1.0,
-  risk_percent       numeric(6,3),
-  fixed_money_risk   numeric(18,2),
-  reverse_trades     boolean NOT NULL DEFAULT false,
-  copy_sl            boolean NOT NULL DEFAULT true,
-  copy_tp            boolean NOT NULL DEFAULT true,
-  copy_modifications boolean NOT NULL DEFAULT true,
-  copy_pending       boolean NOT NULL DEFAULT true,
-  symbol_map         jsonb NOT NULL DEFAULT '{}',   -- {"EURUSD":"EURUSD.pro"}
-  max_signal_age_sec integer NOT NULL DEFAULT 60,   -- ★ staleness guard
-  updated_at         timestamptz NOT NULL DEFAULT now()
-);
-
-risk_settings (
-  id                     uuid PRIMARY KEY,
-  member_account_id      uuid UNIQUE NOT NULL REFERENCES member_accounts ON DELETE CASCADE,
-  max_daily_loss         numeric(18,2),
-  max_daily_loss_pct     numeric(6,3),
-  max_trade_risk         numeric(18,2),
-  max_lot                numeric(12,4),
-  min_lot                numeric(12,4),
-  max_simultaneous_trades integer,
-  max_daily_trades       integer,
-  allowed_symbols        text[],
-  blocked_symbols        text[],
-  max_spread_points      integer,
-  max_slippage_points    integer,
-  trading_hours          jsonb,                  -- {"mon":[["07:00","20:00"]], ...} UTC
-  updated_at             timestamptz NOT NULL DEFAULT now()
-);
-
-copy_orders (
-  id                 uuid PRIMARY KEY,
-  trade_event_id     uuid NOT NULL REFERENCES trade_events ON DELETE CASCADE,
-  master_trade_id    uuid REFERENCES master_trades,
-  master_position_id bigint,                      -- ★ links an exit to its own entry
-  member_account_id  uuid NOT NULL REFERENCES member_accounts ON DELETE CASCADE,
-  action             text NOT NULL,              -- OPEN|MODIFY|CLOSE|PARTIAL_CLOSE
-                                                 -- |PLACE_PENDING|MODIFY_PENDING|CANCEL_PENDING
-  symbol             text NOT NULL,              -- already symbol-mapped
-  side               text,
-  requested_lot      numeric(12,4),              -- master volume
-  calculated_lot     numeric(12,4),              -- after sizing
-  final_lot          numeric(12,4),              -- after broker step/min/max normalization
-  sizing_mode        text,
-  sizing_detail      jsonb,                      -- every input to the calc, for audit
-  stop_loss          numeric(18,5),
-  take_profit        numeric(18,5),
-  master_price       numeric(18,5),
-  execution_price    numeric(18,5),
-  slippage_points    numeric(12,2),
-  status             text NOT NULL DEFAULT 'PENDING',
-                     -- PENDING|SENT|EXECUTED|FAILED|REJECTED|CANCELLED|TIMED_OUT
-  reject_reason      text,                       -- machine code, e.g. RISK_MAX_LOT
-  reject_detail      text,
-  broker_ticket      bigint,
-  broker_retcode     integer,
-  execution_token    text UNIQUE,                -- ★ single-use lease token
-  lease_expires_at   timestamptz,
-  is_paper           boolean NOT NULL DEFAULT false,
-  created_at         timestamptz NOT NULL DEFAULT now(),
-  dispatched_at      timestamptz,
-  executed_at        timestamptz,
-  latency_ms         integer,
-  UNIQUE (trade_event_id, member_account_id)     -- ★ one copy per member per event
-);
-CREATE INDEX ON copy_orders (member_account_id, created_at DESC);
-CREATE INDEX ON copy_orders (status) WHERE status IN ('PENDING','SENT');
-CREATE INDEX ON copy_orders (execution_token);
-CREATE INDEX ON copy_orders (lease_expires_at) WHERE status = 'SENT';
-CREATE INDEX ON copy_orders (member_account_id, master_position_id);
-
--- ─── broker contract specifications, per member ──────────────────────────────
--- Reported by each member's own terminal, never assumed. Volume step is not 0.01
--- everywhere (gold, indices and crypto commonly use 0.1 or 1.0) and tick value
--- depends on the account currency; guessing either is a live-money bug, and
--- risk-based sizing cannot be computed at all without tick value and tick size.
-symbol_specs (
-  id                 uuid PRIMARY KEY,
-  member_account_id  uuid NOT NULL REFERENCES member_accounts ON DELETE CASCADE,
-  symbol             text NOT NULL,
-  volume_min         numeric(12,4) NOT NULL,
-  volume_max         numeric(12,4) NOT NULL,
-  volume_step        numeric(12,4) NOT NULL,
-  tick_value         numeric(18,8),
-  tick_size          numeric(18,8),
-  contract_size      numeric(18,2),
-  digits             smallint NOT NULL DEFAULT 5,
-  trade_allowed      boolean NOT NULL DEFAULT true,
-  updated_at         timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (member_account_id, symbol)
-);
-```
-
----
-
-## 7. Operations
-
-```sql
-execution_logs (                                 -- the lifecycle timeline, append-only
-  id            bigserial PRIMARY KEY,
-  trade_event_id uuid REFERENCES trade_events ON DELETE CASCADE,
-  copy_order_id uuid REFERENCES copy_orders ON DELETE CASCADE,
-  stage         text NOT NULL,                   -- MASTER_EVENT|API_RECEIVED|DB_STORED|…
-  status        text NOT NULL,                   -- OK|RETRY|FAIL
-  message       text,
-  meta          jsonb,
-  at            timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX ON execution_logs (trade_event_id, at);
-CREATE INDEX ON execution_logs (copy_order_id, at);
-
-audit_logs (
-  id            bigserial PRIMARY KEY,
-  actor_user_id uuid REFERENCES users,
-  actor_type    text NOT NULL,                   -- USER|EA|SYSTEM
-  action        text NOT NULL,                   -- MEMBER_CREATED|EMERGENCY_STOP|…
-  entity_type   text, entity_id text,
-  before        jsonb, after jsonb,
-  ip            inet, user_agent text,
-  at            timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX ON audit_logs (at DESC);
-CREATE INDEX ON audit_logs (entity_type, entity_id);
-
-dead_letter_events (
-  id            uuid PRIMARY KEY,
-  source        text NOT NULL,                   -- telegram|copy_dispatch|outbox
-  ref_id        uuid,
-  payload       jsonb NOT NULL,
-  error         text NOT NULL,
-  attempts      smallint NOT NULL,
-  first_failed_at timestamptz NOT NULL,
-  last_failed_at  timestamptz NOT NULL,
-  replayed_at   timestamptz,
-  replayed_by   uuid REFERENCES users
-);
-
-notifications (
-  id         uuid PRIMARY KEY,
-  user_id    uuid REFERENCES users ON DELETE CASCADE,
-  level      text NOT NULL,                      -- INFO|WARN|CRITICAL
-  title      text NOT NULL, body text,
-  meta       jsonb, read_at timestamptz,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-
-system_health (                                  -- latest sample per component
-  component   text PRIMARY KEY,                  -- database|redis|worker|telegram|master_ea
-  status      text NOT NULL,                     -- ONLINE|WARNING|OFFLINE
-  detail      jsonb,
-  checked_at  timestamptz NOT NULL DEFAULT now()
-);
-
-system_settings (                                -- single row, id = 1
-  id                  smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-  mode                text NOT NULL DEFAULT 'LIVE',    -- PAPER | LIVE
-  copying_paused      boolean NOT NULL DEFAULT false,
-  emergency_stop      boolean NOT NULL DEFAULT false,
-  emergency_stop_at   timestamptz,
-  emergency_stop_by   uuid REFERENCES users,
-  emergency_halts_telegram boolean NOT NULL DEFAULT false,
-  live_activated_at   timestamptz,
-  live_activated_by   uuid REFERENCES users,
-  updated_at          timestamptz NOT NULL DEFAULT now()
-);
-```
-
----
-
-## 8. Retention
-
-| Table | Policy |
-|---|---|
-| `trade_events`, `raw_payload` | Keep forever. This is the audit record and the replay source. |
-| `execution_logs` | 180 days, then aggregate into `master_trades` and drop |
-| `audit_logs` | 7 years (financial operations record) |
-| `sessions` | Delete revoked/expired after 30 days |
-| `dead_letter_events` | Keep until explicitly resolved; never auto-delete |
-
-Partition `execution_logs` and `trade_events` by month **only** once either exceeds
-~50M rows. At hundreds of events/day that is decades away — do not pre-partition.
+Make this a first-class, tested command. You will run it more than you expect.

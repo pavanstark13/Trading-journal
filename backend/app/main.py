@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.v1 import admin, auth, copy, ea, health, master, members, risk, telegram, trades, ws
+from app.api.v1 import accounts, admin, auth, ea, health, journal, stats, trades, ws
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger, sentry_before_send
 from app.core.redis import close_redis
@@ -37,7 +37,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="TradeBridge API",
+        title="Trading Journal API",
         version="1.0.0",
         lifespan=lifespan,
         docs_url="/api/v1/docs" if settings.enable_docs else None,
@@ -77,7 +77,7 @@ def create_app() -> FastAPI:
         )
 
     prefix = "/api/v1"
-    for module in (auth, ea, master, members, trades, copy, telegram, risk, admin, health, ws):
+    for module in (auth, ea, accounts, trades, journal, stats, admin, health, ws):
         app.include_router(module.router, prefix=prefix)
     return app
 

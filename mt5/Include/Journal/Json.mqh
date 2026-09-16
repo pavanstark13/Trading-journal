@@ -8,7 +8,7 @@
 #property strict
 
 //+------------------------------------------------------------------+
-string TB_JsonEscape(const string value)
+string J_JsonEscape(const string value)
 {
    string out = value;
    StringReplace(out, "\\", "\\\\");
@@ -19,27 +19,27 @@ string TB_JsonEscape(const string value)
    return out;
 }
 
-string TB_JsonStr(const string key, const string value)
+string J_JsonStr(const string key, const string value)
 {
-   return "\"" + key + "\":\"" + TB_JsonEscape(value) + "\"";
+   return "\"" + key + "\":\"" + J_JsonEscape(value) + "\"";
 }
 
-string TB_JsonNum(const string key, const double value, const int digits)
+string J_JsonNum(const string key, const double value, const int digits)
 {
    return "\"" + key + "\":" + DoubleToString(value, digits);
 }
 
-string TB_JsonInt(const string key, const long value)
+string J_JsonInt(const string key, const long value)
 {
    return "\"" + key + "\":" + IntegerToString(value);
 }
 
-string TB_JsonBool(const string key, const bool value)
+string J_JsonBool(const string key, const bool value)
 {
    return "\"" + key + "\":" + (value ? "true" : "false");
 }
 
-string TB_JsonNull(const string key)
+string J_JsonNull(const string key)
 {
    return "\"" + key + "\":null";
 }
@@ -47,7 +47,7 @@ string TB_JsonNull(const string key)
 //+------------------------------------------------------------------+
 //| ISO-8601 UTC with milliseconds, which is what the API expects.    |
 //+------------------------------------------------------------------+
-string TB_IsoUtc(const long epochMs)
+string J_IsoUtc(const long epochMs)
 {
    datetime seconds = (datetime)(epochMs / 1000);
    int      millis  = (int)(epochMs % 1000);
@@ -61,7 +61,7 @@ string TB_IsoUtc(const long epochMs)
 //| Extract a flat value for "key" from a JSON object. Returns "" if  |
 //| absent. Handles strings, numbers, booleans and null.              |
 //+------------------------------------------------------------------+
-string TB_JsonGet(const string json, const string key)
+string J_JsonGet(const string json, const string key)
 {
    string needle = "\"" + key + "\"";
    int at = StringFind(json, needle);
@@ -105,23 +105,23 @@ string TB_JsonGet(const string json, const string key)
    return raw;
 }
 
-bool TB_JsonGetBool(const string json, const string key, const bool fallback = false)
+bool J_JsonGetBool(const string json, const string key, const bool fallback = false)
 {
-   string value = TB_JsonGet(json, key);
+   string value = J_JsonGet(json, key);
    if(value == "") return fallback;
    return value == "true";
 }
 
-double TB_JsonGetDouble(const string json, const string key, const double fallback = 0.0)
+double J_JsonGetDouble(const string json, const string key, const double fallback = 0.0)
 {
-   string value = TB_JsonGet(json, key);
+   string value = J_JsonGet(json, key);
    if(value == "" || value == "null") return fallback;
    return StringToDouble(value);
 }
 
-long TB_JsonGetLong(const string json, const string key, const long fallback = 0)
+long J_JsonGetLong(const string json, const string key, const long fallback = 0)
 {
-   string value = TB_JsonGet(json, key);
+   string value = J_JsonGet(json, key);
    if(value == "" || value == "null") return fallback;
    return StringToInteger(value);
 }
@@ -130,7 +130,7 @@ long TB_JsonGetLong(const string json, const string key, const long fallback = 0
 //| Split the objects of a top-level JSON array field into elements.  |
 //| Brace-depth aware, so nested objects stay intact.                 |
 //+------------------------------------------------------------------+
-int TB_JsonObjects(const string json, const string arrayKey, string &out[])
+int J_JsonObjects(const string json, const string arrayKey, string &out[])
 {
    ArrayResize(out, 0);
    string needle = "\"" + arrayKey + "\"";

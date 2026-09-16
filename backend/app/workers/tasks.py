@@ -1,36 +1,32 @@
-"""Background work. Each task is idempotent and safe to run concurrently."""
+"""Background work: turn newly ingested deals into trades."""
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
 
 from app.core.db import SessionLocal
 from app.core.logging import get_logger
-from app.core.redis import WS_CHANNEL, get_redis, set_system_flags
-from app.models import CopyOrder, MasterAccount, Outbox, SystemHealth, SystemSettings, TradeEvent
-from app.services import copy_dispatcher, copy_planner, telegram_publisher
+from app.core.redis import WS_CHANNEL, get_redis
+from app.models import Account, Outbox, SystemHealth
+from app.services import rebuild
 
 log = get_logger(__name__)
 
 
-async def broadcast(event_type: str, data: dict[str, Any]) -> None:
-    """Publish to the WebSocket fan-out channel. Never uses process memory."""
-    await get_redis().publish(
-        WS_CHANNEL, json.dumps({"type": event_type, "data": data})
-    )
+async def broadcast(event_type: str, data: dict) -> None:
+    """Publish to the live-update channel. Never process memory, so a second API
+    replica works unchanged."""
+    await get_redis().publish(WS_CHANNEL, json.dumps({"type": event_type, "data": data}))
 
 
 async def relay_outbox(_ctx: dict | None = None, batch: int = 50) -> int:
-    """Move committed outbox rows into the processing pipeline.
+    """Claim outbox rows and rebuild the accounts they name.
 
-    Claims each row with a conditional UPDATE so two workers cannot process the same
-    row, then does the slow work. At-least-once delivery; every downstream step is
-    idempotent, so that is sufficient.
+    Rows are coalesced by account: a backfill that arrives as twenty batches produces
+    one rebuild, not twenty.
     """
-    processed = 0
     async with SessionLocal() as db:
         rows = (
             (
@@ -44,96 +40,68 @@ async def relay_outbox(_ctx: dict | None = None, batch: int = 50) -> int:
             .scalars()
             .all()
         )
+        if not rows:
+            return 0
 
+        claimed_accounts: set = set()
         for row in rows:
-            claimed = await db.execute(
+            result = await db.execute(
                 update(Outbox)
                 .where(Outbox.id == row.id, Outbox.dispatched_at.is_(None))
                 .values(dispatched_at=datetime.now(UTC), attempts=Outbox.attempts + 1)
                 .returning(Outbox.id)
             )
-            if claimed.scalar_one_or_none() is None:
-                continue          # another worker got it
-            await db.commit()
+            if result.scalar_one_or_none() is not None and row.account_id:
+                claimed_accounts.add(row.account_id)
+        await db.commit()
 
+        rebuilt = 0
+        for account_id in claimed_accounts:
+            account = await db.get(Account, account_id)
+            if account is None:
+                continue
             try:
-                await _process_trade_event(db, row)
-                processed += 1
-            except Exception as exc:
-                log.error("outbox.failed", outbox_id=row.id, error=str(exc))
-                await db.rollback()
-                await db.execute(
-                    update(Outbox).where(Outbox.id == row.id).values(dispatched_at=None)
+                count = await rebuild.rebuild_account(db, account)
+                rebuilt += 1
+                await broadcast(
+                    "account.rebuilt",
+                    {"account_id": str(account_id), "trades": count},
                 )
-                await db.commit()
-
-    return processed
-
-
-async def _process_trade_event(db: Any, row: Outbox) -> None:
-    event = await db.get(TradeEvent, row.trade_event_id)
-    if event is None:
-        return
-
-    # Telegram and copying are independent: a Telegram outage must not delay copying,
-    # and a failed copy must not block the channel post.
-    await telegram_publisher.queue_for_publish(db, event)
-
-    orders = await copy_planner.plan(db, event)
-    for order in orders:
-        if order.status == "PENDING":
-            await copy_dispatcher.dispatch(db, order)
-
-    event.processing_status = "PROCESSED"
-    await db.commit()
-
-    await broadcast(
-        "trade.event",
-        {
-            "trade_event_id": str(event.id),
-            "event_type": event.event_type,
-            "symbol": event.symbol,
-            "side": event.side,
-            "volume": str(event.volume or 0),
-            "price": str(event.price or 0),
-            "occurred_at": event.occurred_at.isoformat(),
-            "copy_orders": len(orders),
-        },
-    )
+            except Exception as exc:
+                await db.rollback()
+                log.error("rebuild.failed", account_id=str(account_id), error=str(exc))
+                account = await db.get(Account, account_id)
+                if account:
+                    account.sync_status = "ERROR"
+                    account.sync_error = str(exc)[:500]
+                    await db.commit()
+        return rebuilt
 
 
-async def publish_telegram(_ctx: dict | None = None) -> int:
+async def refresh_provisional(_ctx: dict | None = None) -> int:
+    """Clear the provisional flag once the settling window has passed.
+
+    A trade closed on Friday can have its swap booked on Monday, so its P/L is not
+    final the moment it closes. After a week it is.
+    """
+    from app.models import Trade
+
+    cutoff = datetime.now(UTC) - timedelta(days=rebuild.PROVISIONAL_DAYS)
     async with SessionLocal() as db:
-        return await telegram_publisher.publish_pending(db)
-
-
-async def expire_leases(_ctx: dict | None = None) -> int:
-    async with SessionLocal() as db:
-        expired = await copy_dispatcher.expire_stale_leases(db)
-    if expired:
-        await broadcast(
-            "system.alert",
-            {"level": "WARN", "title": f"{expired} copy leases expired"},
-        )
-    return expired
-
-
-async def refresh_system_flags(_ctx: dict | None = None) -> None:
-    """Mirror the Postgres source of truth into Redis for the EA fast path."""
-    async with SessionLocal() as db:
-        system = await db.get(SystemSettings, 1)
-        if system:
-            await set_system_flags(
-                emergency_stop=system.emergency_stop,
-                copying_paused=system.copying_paused,
-                mode=system.mode,
+        result = await db.execute(
+            update(Trade)
+            .where(
+                Trade.pl_provisional.is_(True),
+                Trade.status == "closed",
+                Trade.closed_at < cutoff,
             )
+            .values(pl_provisional=False)
+        )
+        await db.commit()
+        return result.rowcount or 0
 
 
 async def health_sweep(_ctx: dict | None = None) -> dict[str, str]:
-    """Record component health and flag stale EAs."""
-    from app.core.config import settings
-
     statuses: dict[str, str] = {}
     async with SessionLocal() as db:
         try:
@@ -141,28 +109,16 @@ async def health_sweep(_ctx: dict | None = None) -> dict[str, str]:
             statuses["database"] = "ONLINE"
         except Exception:
             statuses["database"] = "OFFLINE"
-
         try:
             await get_redis().ping()
             statuses["redis"] = "ONLINE"
         except Exception:
             statuses["redis"] = "OFFLINE"
 
-        master = (await db.execute(select(MasterAccount).limit(1))).scalar_one_or_none()
-        if master is None or master.last_heartbeat_at is None:
-            statuses["master_ea"] = "OFFLINE"
-        else:
-            age = (datetime.now(UTC) - master.last_heartbeat_at).total_seconds()
-            statuses["master_ea"] = (
-                "ONLINE"
-                if age < settings.master_heartbeat_timeout_sec
-                else "WARNING"
-                if age < settings.master_heartbeat_timeout_sec * 3
-                else "OFFLINE"
-            )
-
         pending = (
-            await db.execute(select(Outbox).where(Outbox.dispatched_at.is_(None)).limit(101))
+            await db.execute(
+                select(Outbox).where(Outbox.dispatched_at.is_(None)).limit(101)
+            )
         ).scalars().all()
         statuses["worker"] = "WARNING" if len(pending) > 100 else "ONLINE"
 
@@ -174,22 +130,4 @@ async def health_sweep(_ctx: dict | None = None) -> dict[str, str]:
             else:
                 db.add(SystemHealth(component=component, status=state))
         await db.commit()
-
-    await broadcast("health", statuses)
     return statuses
-
-
-async def aggregate_daily_pl(_ctx: dict | None = None) -> int:
-    """Roll up each member's realised P/L for the day, feeding the max_daily_loss gate."""
-    async with SessionLocal() as db:
-        today = datetime.now(UTC).date()
-        orders = (
-            (
-                await db.execute(
-                    select(CopyOrder).where(CopyOrder.status == "EXECUTED")
-                )
-            )
-            .scalars()
-            .all()
-        )
-        return sum(1 for o in orders if o.executed_at and o.executed_at.date() == today)

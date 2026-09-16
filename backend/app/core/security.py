@@ -48,10 +48,10 @@ class UserPrincipal:
 
 @dataclass(frozen=True, slots=True)
 class EaPrincipal:
+    """A terminal, authenticated by HMAC and bound to exactly one account."""
+
     installation_id: uuid.UUID
-    kind: str                       # MASTER | MEMBER
-    master_account_id: uuid.UUID | None
-    member_account_id: uuid.UUID | None
+    account_id: uuid.UUID
 
 
 def create_access_token(

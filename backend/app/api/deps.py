@@ -15,7 +15,7 @@ from app.core.config import settings
 from app.core.db import get_session
 from app.core.redis import check_and_store_nonce
 from app.core.security import EaPrincipal, Role, TokenError, UserPrincipal, decode_access_token
-from app.models import EaInstallation, User
+from app.models import Account, EaInstallation, User
 
 # Every EA authentication failure returns this exact response. Distinguishing "unknown
 # key" from "bad signature" would hand an attacker a key-enumeration oracle.
@@ -118,12 +118,7 @@ async def verify_ea_request(
     install.last_seen_ip = request.client.host if request.client else None
     await db.commit()
 
-    return EaPrincipal(
-        installation_id=install.id,
-        kind=install.kind,
-        master_account_id=install.master_account_id,
-        member_account_id=install.member_account_id,
-    )
+    return EaPrincipal(installation_id=install.id, account_id=install.account_id)
 
 
 def _installation_secret(install: EaInstallation) -> str:
@@ -149,21 +144,45 @@ def _matches_previous_secret(
     return crypto.signatures_equal(expected, signature)
 
 
-async def require_master_ea(
+async def ea_account(
     principal: EaPrincipal = Depends(verify_ea_request),
-) -> EaPrincipal:
-    if principal.kind != "MASTER" or principal.master_account_id is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Master EA credential required")
-    return principal
+    db: AsyncSession = Depends(get_session),
+) -> Account:
+    """The account this terminal is allowed to write to, and only this one."""
+    account = await db.get(Account, principal.account_id)
+    if account is None or account.is_archived:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Account is not active")
+    return account
 
 
-async def require_member_ea(
-    principal: EaPrincipal = Depends(verify_ea_request),
-) -> EaPrincipal:
-    if principal.kind != "MEMBER" or principal.member_account_id is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Member EA credential required")
-    return principal
+async def owned_account(
+    account_id: uuid.UUID,
+    principal: UserPrincipal = Depends(current_principal),
+    db: AsyncSession = Depends(get_session),
+) -> Account:
+    """Load an account, or 404 if it is not this trader's.
+
+    404 rather than 403 on purpose: another trader's account id should not be
+    confirmable by probing.
+    """
+    account = await db.get(Account, account_id)
+    if account is None or (not principal.is_admin and account.user_id != principal.user_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found")
+    return account
 
 
-def owns_member_account(principal: UserPrincipal, member_user_id: uuid.UUID) -> bool:
-    return principal.is_admin or principal.user_id == member_user_id
+async def owned_account_ids(
+    principal: UserPrincipal, db: AsyncSession, account_id: uuid.UUID | None = None
+) -> list[uuid.UUID]:
+    """Every account the caller may read, optionally narrowed to one.
+
+    Every statistics query funnels through here, so scoping is written once.
+    """
+    from sqlalchemy import select as _select
+
+    stmt = _select(Account.id).where(Account.is_archived.is_(False))
+    if not principal.is_admin:
+        stmt = stmt.where(Account.user_id == principal.user_id)
+    if account_id is not None:
+        stmt = stmt.where(Account.id == account_id)
+    return list((await db.execute(stmt)).scalars().all())

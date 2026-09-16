@@ -18,13 +18,13 @@ from app.core.db import SessionLocal
 from app.core.logging import get_logger
 from app.core.redis import WS_CHANNEL, get_redis
 from app.core.security import Role, TokenError, decode_access_token
-from app.models import MemberAccount
+from app.models import Account
 
 router = APIRouter()
 log = get_logger(__name__)
 
-#: Event types only admins may see. Members get their own copy updates and nothing else.
-_ADMIN_ONLY = frozenset({"trade.event", "master.telemetry", "ea.status", "health", "system.alert"})
+#: Only admins see system-wide signals. A trader sees events for their own accounts.
+_ADMIN_ONLY = frozenset({"health", "system.alert"})
 
 
 @router.websocket("/ws")
@@ -44,9 +44,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
                 str(row)
                 for row in (
                     await db.execute(
-                        select(MemberAccount.id).where(
-                            MemberAccount.user_id == principal.user_id
-                        )
+                        select(Account.id).where(Account.user_id == principal.user_id)
                     )
                 ).scalars()
             }
@@ -90,5 +88,5 @@ def _visible_to(message: dict, role: Role, owned_accounts: set[str]) -> bool:
         return True
     if message.get("type") in _ADMIN_ONLY:
         return False
-    account_id = str(message.get("data", {}).get("member_account_id", ""))
+    account_id = str(message.get("data", {}).get("account_id", ""))
     return account_id in owned_accounts

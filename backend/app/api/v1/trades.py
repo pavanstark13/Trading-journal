@@ -1,188 +1,254 @@
-"""Trade event history and the per-event lifecycle timeline."""
+"""The trade log: what you traded, and everything behind each number."""
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import current_principal
+from app.api.deps import current_principal, owned_account_ids
 from app.core.db import get_session
 from app.core.security import UserPrincipal
-from app.models import CopyOrder, ExecutionLog, MemberAccount, TelegramMessage, TradeEvent
+from app.models import Account, JournalEntry, Screenshot, Setup, Tag, Trade, TradeLeg, TradeTag
 
 router = APIRouter(prefix="/trades", tags=["trades"])
 
 
-def _serialize(event: TradeEvent) -> dict:
+def _serialize(trade: Trade) -> dict:
     return {
-        "id": str(event.id),
-        "event_id": event.event_id,
-        "event_type": event.event_type,
-        "ticket": event.ticket,
-        "position_id": event.position_id,
-        "symbol": event.symbol,
-        "side": event.side,
-        "volume": str(event.volume) if event.volume is not None else None,
-        "price": str(event.price) if event.price is not None else None,
-        "stop_loss": str(event.stop_loss) if event.stop_loss is not None else None,
-        "take_profit": str(event.take_profit) if event.take_profit is not None else None,
-        "profit": str(event.profit) if event.profit is not None else None,
-        "processing_status": event.processing_status,
-        "ignore_reason": event.ignore_reason,
-        "occurred_at": event.occurred_at,
-        "received_at": event.received_at,
+        "id": str(trade.id),
+        "account_id": str(trade.account_id),
+        "trade_key": trade.trade_key,
+        "symbol": trade.symbol,
+        "direction": trade.direction,
+        "status": trade.status,
+        "opened_at": trade.opened_at,
+        "closed_at": trade.closed_at,
+        "volume_opened": str(trade.volume_opened),
+        "volume_closed": str(trade.volume_closed),
+        "avg_entry_price": str(trade.avg_entry_price) if trade.avg_entry_price else None,
+        "avg_exit_price": str(trade.avg_exit_price) if trade.avg_exit_price else None,
+        "initial_sl": str(trade.initial_sl) if trade.initial_sl else None,
+        "initial_tp": str(trade.initial_tp) if trade.initial_tp else None,
+        "gross_profit": str(trade.gross_profit),
+        "commission": str(trade.commission),
+        "swap": str(trade.swap),
+        "net_profit": str(trade.net_profit),
+        "risk_amount": str(trade.risk_amount) if trade.risk_amount else None,
+        "r_multiple": str(trade.r_multiple) if trade.r_multiple is not None else None,
+        "pips": str(trade.pips) if trade.pips is not None else None,
+        "duration_seconds": trade.duration_seconds,
+        "exit_reason": trade.exit_reason,
+        "session": trade.session,
+        "hour_of_day": trade.hour_of_day,
+        "day_of_week": trade.day_of_week,
+        "trade_date": trade.trade_date,
+        #: Brokers book swap and commission late, so a recently closed trade's cost
+        #: can still change. Flagged rather than silently corrected later.
+        "pl_provisional": trade.pl_provisional,
     }
 
 
 @router.get("")
 async def list_trades(
+    account_id: uuid.UUID | None = None,
     symbol: str | None = None,
-    event_type: str | None = None,
-    side: str | None = None,
-    date_from: datetime | None = Query(default=None, alias="from"),
-    date_to: datetime | None = Query(default=None, alias="to"),
-    limit: int = Query(default=50, le=200),
+    direction: str | None = None,
+    status_filter: str | None = Query(default=None, alias="status"),
+    session: str | None = None,
+    outcome: str | None = Query(default=None, pattern="^(win|loss|scratch)$"),
+    has_journal: bool | None = None,
+    date_from: date | None = Query(default=None, alias="from"),
+    date_to: date | None = Query(default=None, alias="to"),
+    limit: int = Query(default=50, le=500),
     offset: int = 0,
     principal: UserPrincipal = Depends(current_principal),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
-    if not principal.is_admin:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin role required")
+    account_ids = await owned_account_ids(principal, db, account_id)
+    if not account_ids:
+        return {"items": [], "total": 0, "limit": limit, "offset": offset}
 
-    stmt = select(TradeEvent).order_by(TradeEvent.occurred_at.desc())
+    stmt = select(Trade).where(Trade.account_id.in_(account_ids))
     if symbol:
-        stmt = stmt.where(TradeEvent.symbol == symbol.upper())
-    if event_type:
-        stmt = stmt.where(TradeEvent.event_type == event_type)
-    if side:
-        stmt = stmt.where(TradeEvent.side == side.upper())
+        stmt = stmt.where(Trade.symbol == symbol.upper())
+    if direction:
+        stmt = stmt.where(Trade.direction == direction)
+    if status_filter:
+        stmt = stmt.where(Trade.status == status_filter)
+    if session:
+        stmt = stmt.where(Trade.session == session)
     if date_from:
-        stmt = stmt.where(TradeEvent.occurred_at >= date_from)
+        stmt = stmt.where(Trade.trade_date >= date_from)
     if date_to:
-        stmt = stmt.where(TradeEvent.occurred_at <= date_to)
+        stmt = stmt.where(Trade.trade_date <= date_to)
+    if outcome == "win":
+        stmt = stmt.where(Trade.net_profit > 0)
+    elif outcome == "loss":
+        stmt = stmt.where(Trade.net_profit < 0)
 
-    events = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    total = (
+        await db.execute(select(func.count()).select_from(stmt.subquery()))
+    ).scalar_one()
 
-    # Roll up the delivery status of each event so the table is useful at a glance.
-    items = []
-    for event in events:
-        tg = (
-            (
-                await db.execute(
-                    select(TelegramMessage).where(TelegramMessage.trade_event_id == event.id)
-                )
+    trades = (
+        (
+            await db.execute(
+                stmt.order_by(Trade.opened_at.desc()).limit(limit).offset(offset)
             )
-            .scalars()
-            .all()
         )
-        copies = (
-            (
+        .scalars()
+        .all()
+    )
+
+    # Which trades already have a note, so the log can show what still needs writing up.
+    keys = [t.trade_key for t in trades]
+    journalled = set()
+    tags_by_key: dict[str, list[str]] = {}
+    if keys:
+        journalled = {
+            (e.account_id, e.trade_key)
+            for e in (
                 await db.execute(
-                    select(CopyOrder).where(CopyOrder.trade_event_id == event.id)
+                    select(JournalEntry).where(
+                        JournalEntry.account_id.in_(account_ids),
+                        JournalEntry.trade_key.in_(keys),
+                    )
                 )
-            )
-            .scalars()
-            .all()
-        )
-        item = _serialize(event)
-        item["telegram_status"] = (
-            "NONE" if not tg else
-            "SENT" if any(m.status in ("SENT", "EDITED") for m in tg) else
-            "DEAD" if any(m.status == "DEAD" for m in tg) else "PENDING"
-        )
-        item["copy_summary"] = {
-            "total": len(copies),
-            "executed": sum(1 for c in copies if c.status == "EXECUTED"),
-            "failed": sum(1 for c in copies if c.status in ("FAILED", "TIMED_OUT")),
-            "rejected": sum(1 for c in copies if c.status in ("REJECTED", "CANCELLED")),
+            ).scalars()
         }
-        items.append(item)
+        tag_names = {t.id: t.name for t in (await db.execute(select(Tag))).scalars()}
+        for link in (
+            await db.execute(
+                select(TradeTag).where(
+                    TradeTag.account_id.in_(account_ids), TradeTag.trade_key.in_(keys)
+                )
+            )
+        ).scalars():
+            name = tag_names.get(link.tag_id)
+            if name:
+                tags_by_key.setdefault(link.trade_key, []).append(name)
 
-    return {"items": items, "limit": limit, "offset": offset}
+    items = []
+    for trade in trades:
+        row = _serialize(trade)
+        row["has_journal"] = (trade.account_id, trade.trade_key) in journalled
+        row["tags"] = tags_by_key.get(trade.trade_key, [])
+        items.append(row)
+
+    if has_journal is not None:
+        items = [i for i in items if i["has_journal"] is has_journal]
+
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
-@router.get("/{event_id}")
+@router.get("/symbols")
+async def traded_symbols(
+    principal: UserPrincipal = Depends(current_principal),
+    db: AsyncSession = Depends(get_session),
+) -> list[str]:
+    account_ids = await owned_account_ids(principal, db)
+    if not account_ids:
+        return []
+    rows = await db.execute(
+        select(Trade.symbol).where(Trade.account_id.in_(account_ids)).distinct()
+    )
+    return sorted(row for row in rows.scalars() if row)
+
+
+@router.get("/{trade_id}")
 async def get_trade(
-    event_id: uuid.UUID,
+    trade_id: uuid.UUID,
     principal: UserPrincipal = Depends(current_principal),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
-    if not principal.is_admin:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin role required")
-    event = await db.get(TradeEvent, event_id)
-    if event is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Trade event not found")
+    trade = await db.get(Trade, trade_id)
+    if trade is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Trade not found")
 
-    copies = (
-        (await db.execute(select(CopyOrder).where(CopyOrder.trade_event_id == event.id)))
-        .scalars()
-        .all()
-    )
-    members = {
-        m.id: m
-        for m in (await db.execute(select(MemberAccount))).scalars().unique().all()
-    }
+    account = await db.get(Account, trade.account_id)
+    if account is None or (not principal.is_admin and account.user_id != principal.user_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Trade not found")
 
-    return {
-        **_serialize(event),
-        "raw_payload": event.raw_payload,
-        "copy_orders": [
-            {
-                "id": str(c.id),
-                "member": members[c.member_account_id].label
-                if c.member_account_id in members
-                else str(c.member_account_id),
-                "status": c.status,
-                "requested_lot": str(c.requested_lot or 0),
-                "final_lot": str(c.final_lot or 0),
-                "execution_price": str(c.execution_price) if c.execution_price else None,
-                "slippage_points": str(c.slippage_points) if c.slippage_points else None,
-                "broker_ticket": c.broker_ticket,
-                "reject_reason": c.reject_reason,
-                "reject_detail": c.reject_detail,
-                "latency_ms": c.latency_ms,
-                "is_paper": c.is_paper,
-            }
-            for c in copies
-        ],
-        "timeline": await _timeline(db, event.id),
-    }
-
-
-@router.get("/{event_id}/timeline")
-async def timeline(
-    event_id: uuid.UUID,
-    principal: UserPrincipal = Depends(current_principal),
-    db: AsyncSession = Depends(get_session),
-) -> list[dict]:
-    if not principal.is_admin:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin role required")
-    return await _timeline(db, event_id)
-
-
-async def _timeline(db: AsyncSession, event_id: uuid.UUID) -> list[dict]:
-    logs = (
+    legs = (
         (
             await db.execute(
-                select(ExecutionLog)
-                .where(ExecutionLog.trade_event_id == event_id)
-                .order_by(ExecutionLog.at)
+                select(TradeLeg).where(TradeLeg.trade_id == trade.id).order_by(TradeLeg.seq)
             )
         )
         .scalars()
         .all()
     )
-    return [
-        {
-            "stage": entry.stage,
-            "status": entry.status,
-            "message": entry.message,
-            "meta": entry.meta,
-            "at": entry.at,
-            "copy_order_id": str(entry.copy_order_id) if entry.copy_order_id else None,
-        }
-        for entry in logs
+    entry = (
+        await db.execute(
+            select(JournalEntry).where(
+                JournalEntry.account_id == trade.account_id,
+                JournalEntry.trade_key == trade.trade_key,
+            )
+        )
+    ).scalar_one_or_none()
+    setup = await db.get(Setup, entry.setup_id) if entry and entry.setup_id else None
+
+    tag_names = {t.id: t.name for t in (await db.execute(select(Tag))).scalars()}
+    tags = [
+        tag_names[link.tag_id]
+        for link in (
+            await db.execute(
+                select(TradeTag).where(
+                    TradeTag.account_id == trade.account_id,
+                    TradeTag.trade_key == trade.trade_key,
+                )
+            )
+        ).scalars()
+        if link.tag_id in tag_names
     ]
+    shots = (
+        (
+            await db.execute(
+                select(Screenshot).where(
+                    Screenshot.account_id == trade.account_id,
+                    Screenshot.trade_key == trade.trade_key,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return {
+        **_serialize(trade),
+        "account_label": account.label,
+        "currency": account.currency,
+        # Every number on this page traces back to the broker deals that produced it.
+        "legs": [
+            {
+                "seq": leg.seq, "type": leg.leg_type, "deal_ticket": leg.deal_ticket,
+                "volume": str(leg.volume), "price": str(leg.price),
+                "time_msc": leg.time_msc,
+            }
+            for leg in legs
+        ],
+        "journal": None if entry is None else {
+            "thesis": entry.thesis,
+            "execution_notes": entry.execution_notes,
+            "lesson": entry.lesson,
+            "emotion": entry.emotion,
+            "confidence": entry.confidence,
+            "followed_plan": entry.followed_plan,
+            "mistakes": entry.mistakes or [],
+            "grade": entry.grade,
+            "setup_id": str(entry.setup_id) if entry.setup_id else None,
+            "setup_name": setup.name if setup else None,
+            "updated_at": entry.updated_at,
+        },
+        "tags": tags,
+        "screenshots": [
+            {
+                "id": str(shot.id), "kind": shot.kind, "timeframe": shot.timeframe,
+                "caption": shot.caption, "storage_key": shot.storage_key,
+            }
+            for shot in shots
+        ],
+    }

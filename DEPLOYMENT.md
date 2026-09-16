@@ -1,220 +1,130 @@
-# DEPLOYMENT
+# 06 — Operations, Cost, Security, Compliance
 
-Two machines. One Ubuntu server runs everything; one Windows VPS runs MetaTrader.
+Sized for **≤50 members**, each with 1–3 MT5 accounts.
 
----
+## 1. Load reality check
 
-## 1. Topology
+| Quantity | Estimate |
+|---|---|
+| Members | 50 |
+| Connected accounts | ~100 |
+| Deals per active trader per day | 10–60 |
+| Deals per day, all users | ~3,000 peak |
+| Deals per year, all users | ~1M |
+| Historical backfill per account | 2k–20k deals |
+| Ingest requests/sec | **< 1** |
+| Screenshots | ~20 MB/user/month → ~12 GB/year total |
+| Postgres size after year 1 | **< 15 GB** (raw_deals dominates) |
 
-| Host | Runs | Spec | Approx cost |
-|---|---|---|---|
-| **App server** (Ubuntu 24.04) | Caddy, frontend, backend, worker, Postgres, Redis | 4 vCPU / 8 GB / 80 GB SSD | €13–20/mo |
-| **MT5 host** (Windows Server 2022) | Master MT5 terminal (+ any member terminals you host) | 4 vCPU / 8–16 GB | $30–60/mo |
+This fits on one small VPS with room to spare. The database is not your bottleneck;
+the Windows sync box is (and only if you ship Tier 2).
 
-Members normally run the member EA on **their own** machine or VPS, so the Windows box
-only needs to carry the master terminal for v1.
-
-Put the MT5 host near the broker (LD4/NY4 if your broker is there). Latency between the
-MT5 host and the app server matters far less — that path is not in the execution loop.
-
----
-
-## 2. Services
+## 2. Deployment
 
 ```yaml
-# infra/docker-compose.yml
+# infra/docker-compose.yml  (Linux VPS — Hetzner CX32, 4 vCPU / 8 GB ≈ €13/mo)
 services:
-  caddy:      # :80 :443 — TLS, reverse proxy, WebSocket upgrade
-  frontend:   # Next.js 15 standalone, :3000 (internal)
-  backend:    # FastAPI via uvicorn, :8000 (internal), 2 workers
-  worker:     # arq — outbox relay, telegram, copy planner/dispatcher, cron
-  postgres:   # 16, named volume, internal only
-  redis:      # 7, appendonly yes, requirepass, internal only
+  caddy:       # TLS, reverse proxy;  flush_interval -1 on /events for SSE
+  web:         # Next.js 15, standalone output
+  api:         # FastAPI (uvicorn, 2 workers)
+  worker:      # arq — reconstruction + enrichment + cron
+  postgres:    # 16, volume-mounted, tuned: shared_buffers 2GB
+  redis:       # 7, appendonly yes
+  minio:       # or skip and use Cloudflare R2
 ```
 
-Only `caddy` publishes ports. Postgres and Redis are reachable on the Docker network
-only — never `ports:` them, not even to `127.0.0.1`, unless you are actively debugging.
+Deploy = `git pull && docker compose up -d --build`. Migrations run in the api container's
+entrypoint (`alembic upgrade head`). That is the entire release process, and at this scale
+it should stay that way.
 
-**Healthchecks** on every service; `backend` depends on `postgres`/`redis` being healthy;
-`worker` depends on `backend` having run migrations.
+**Windows VPS (only if Tier 2 ships):** Contabo/Kamatera, 16 GB / 4 vCPU, ≈ $40–60/mo.
+6–8 portable MT5 installs, one Python service, auto-restart on crash via NSSM or a
+scheduled task. Treat it as cattle — a documented rebuild script beats a pet you fix.
 
-**Migrations** run in the backend entrypoint (`alembic upgrade head`) before uvicorn
-starts, guarded by a Postgres advisory lock so two replicas can't race.
+## 3. Monthly cost
 
----
-
-## 3. First deploy
-
-```bash
-# on the app server, as a non-root user in the docker group
-git clone git@github.com:<you>/trading-journal.git /srv/app && cd /srv/app
-cp .env.example .env
-
-# generate real secrets — do not reuse the examples
-python3 -c "import secrets;print('JWT_SECRET='+secrets.token_urlsafe(48))"        >> .env
-python3 -c "import secrets;print('MASTER_ENCRYPTION_KEY='+secrets.token_urlsafe(32))" >> .env
-python3 -c "import secrets;print('POSTGRES_PASSWORD='+secrets.token_urlsafe(24))" >> .env
-python3 -c "import secrets;print('REDIS_PASSWORD='+secrets.token_urlsafe(24))"    >> .env
-
-docker compose -f infra/docker-compose.yml up -d --build
-docker compose exec backend python -m app.cli create-superadmin \
-    --email you@example.com          # prompts for a password, never takes it as an arg
-```
-
-DNS: point `app.<domain>` and `api.<domain>` at the server. Caddy obtains certificates
-automatically on first request — nothing else to do.
-
-Then, in the dashboard:
-1. Create the master account record → generate an install code → install the master EA
-   (see [MT5_INTEGRATION §6](MT5_INTEGRATION.md#6-installation-what-the-docs-must-cover)).
-2. Configure the Telegram channel, press **Test** — a test message, never a fake trade.
-3. Create members, issue install codes, have them install the member EA.
-4. **Before enabling copying for anyone**, run one live trade on the master with every
-   member still switched off, and confirm on `/trades` that it was ingested, published
-   to Telegram, and produced a copy order per member with the lot size you expect
-   (rejected with `COPY_DISABLED` is the correct outcome at this stage — the sizing is
-   still computed and visible). Then enable members one at a time, smallest first.
-
----
-
-## 4. Environment variables
-
-```ini
-# ── core ───────────────────────────────────────────────────────────────────
-ENV=production
-DEFAULT_MODE=LIVE                # mode a fresh install seeds; runtime setting wins after
-API_BASE_URL=https://api.example.com
-FRONTEND_ORIGIN=https://app.example.com
-ENABLE_DOCS=false
-
-# ── secrets (generate; never commit) ───────────────────────────────────────
-JWT_SECRET=
-MASTER_ENCRYPTION_KEY=
-POSTGRES_PASSWORD=
-REDIS_PASSWORD=
-
-# ── datastores ─────────────────────────────────────────────────────────────
-DATABASE_URL=postgresql+asyncpg://app:${POSTGRES_PASSWORD}@postgres:5432/app
-REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
-
-# ── auth ───────────────────────────────────────────────────────────────────
-ACCESS_TOKEN_TTL_MIN=15
-REFRESH_TOKEN_TTL_DAYS=30
-REQUIRE_2FA_FOR_SUPERADMIN=true
-
-# ── EA ─────────────────────────────────────────────────────────────────────
-EA_TIMESTAMP_SKEW_SEC=120
-EA_NONCE_TTL_SEC=300
-EA_EVENT_BATCH_MAX=100
-MEMBER_POLL_WAIT_SEC=25
-MEMBER_HEARTBEAT_TIMEOUT_SEC=90
-
-# ── copy engine ────────────────────────────────────────────────────────────
-DEFAULT_MAX_SIGNAL_AGE_SEC=60
-COPY_LEASE_TTL_SEC=45
-
-# ── telegram ───────────────────────────────────────────────────────────────
-TELEGRAM_MAX_RETRIES=6
-TELEGRAM_RATE_LIMIT_PER_SEC=20     # below Telegram's ~30/s ceiling
-
-# ── observability ──────────────────────────────────────────────────────────
-SENTRY_DSN=
-LOG_LEVEL=INFO
-PROMETHEUS_ENABLED=true
-```
-
-Telegram bot tokens are **not** here — they live encrypted in the database, configured
-through the dashboard, so they can be rotated without a redeploy.
-
----
-
-## 5. Caddyfile
-
-```caddy
-app.example.com {
-    encode gzip zstd
-    reverse_proxy frontend:3000
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        X-Content-Type-Options nosniff
-        X-Frame-Options DENY
-        Referrer-Policy strict-origin-when-cross-origin
-    }
-}
-
-api.example.com {
-    encode gzip zstd
-    @ws  header Connection *Upgrade*
-    reverse_proxy @ws backend:8000
-    # long-poll and SSE must not be buffered
-    reverse_proxy /api/v1/ea/member/poll backend:8000 {
-        flush_interval -1
-        transport http { read_timeout 60s }
-    }
-    reverse_proxy backend:8000
-}
-```
-
----
-
-## 6. CI/CD (GitHub Actions)
-
-| Workflow | Triggers | Does |
+| Item | MVP (Tiers 1+3) | With Tier 2 |
 |---|---|---|
-| `ci.yml` | PR, push | ruff · mypy · pytest (unit + integration with service containers) · eslint · tsc · `next build` · `docker build` · Trivy · gitleaks |
-| `ea-parity.yml` | PR touching `mt5/` or `app/domain/events.py` | Asserts MQL5-generated `event_id` fixtures match the Python implementation — **a release gate** |
-| `deploy.yml` | tag `v*` | Builds and pushes images, SSHes to the server, `docker compose pull && up -d`, waits for `/health`, rolls back on failure |
+| Linux VPS | €13 | €13 |
+| Windows VPS | — | $50 |
+| Object storage (R2, 15 GB) | ~$0.25 | ~$0.25 |
+| Domain + email (Resend free tier) | ~$1.5 | ~$1.5 |
+| Sentry / Uptime Kuma | free tiers | free tiers |
+| Backups (S3, 50 GB versioned) | ~$1.5 | ~$1.5 |
+| **Total** | **≈ $20/mo** | **≈ $72/mo** |
 
-Required checks on `main`: all of `ci.yml` plus `ea-parity.yml`. No direct pushes.
+At 50 members × ₹800/mo that's comfortably profitable. **The reason Tier 1 (user-installed
+EA) is the default is right here in this table** — it is the difference between a $20 and a
+$72 floor, and it stays flat as you grow while Tier 2 does not.
 
----
+## 4. Backups (the part people skip and regret)
 
-## 7. Backups & disaster recovery
+- `pg_dump` nightly → object storage, **30 daily / 12 monthly**, versioned bucket.
+- Test the restore **quarterly**, into a scratch container, and record how long it took.
+  An untested backup is a rumour.
+- `raw_deals` is the crown jewel: everything else is derivable. Consider a separate,
+  more frequent export of just that table.
+- Screenshots: bucket versioning + lifecycle. Users will delete a trade and want the
+  image back.
 
-```bash
-# infra/backup.sh — cron: 0 2 * * *
-pg_dump --format=custom | age -r "$BACKUP_PUBKEY" | \
-  aws s3 cp - "s3://$BUCKET/db/$(date +%F).dump.age"
-```
+## 5. Monitoring that matters
 
-- Retention: 30 daily, 12 monthly, versioned bucket, encrypted at rest.
-- **Test the restore quarterly** into a scratch container. Record the date and the
-  elapsed time at the top of `RUNBOOK-restore.md`. An untested backup is a rumour.
-- RPO 24 h (tighten with WAL archiving if that becomes unacceptable); RTO ~30 min.
+Three alerts. Only three, or you'll start ignoring them.
 
-**What survives a total loss of the app server:** everything in Postgres. **What does
-not:** in-flight Redis jobs (recovered from the outbox) and unsent EA spool (still on the
-MT5 host, replayed on reconnect). This is why the outbox and the EA spool both exist.
+1. **Ingest endpoint down** → Uptime Kuma, 1-minute check.
+2. **Account sync stale** → any `accounts.last_heartbeat_at` older than 2 h for an
+   `is_active` subscriber → email the *user*, not just you. They usually just closed MT5,
+   and telling them is the feature.
+3. **Reconstruction worker error rate** → Sentry alert on any unhandled exception in
+   `reconstruct.py`. This is the one that silently corrupts data.
 
-**Recovery order:** restore Postgres → start backend (migrations are idempotent) → start
-worker → EAs reconnect and drain their spools → verify no duplicate Telegram posts
-(idempotency keys make this a non-event) → clear any DLQ deliberately.
+Also worth a dashboard row (not an alert): deals ingested per hour, trades built per run,
+and the count of trades with `r_multiple IS NULL`.
 
----
+## 6. Security checklist
 
-## 8. Monitoring
+- [ ] Investor (read-only) passwords only — reject anything that can trade
+- [ ] Envelope encryption: per-account DEK, wrapped by a master key in env/KMS, never
+      in the DB alongside the ciphertext
+- [ ] Decryption happens only in the sync worker process
+- [ ] Sentry + log scrubbers for `password`, `investor_pw`, `ea_secret`, `Authorization`
+- [ ] HMAC-SHA256 on every EA request; ±120 s skew window; nonce replay cache in Redis
+- [ ] Per-account EA secret, rotatable from the UI, last-used IP displayed
+- [ ] Rate limit ingest per account (e.g. 60 req/min) — a looping EA must not DoS you
+- [ ] Windows VPS: outbound-only firewall + allowlist to your ingest IP; no RDP from the
+      open internet (Tailscale or an IP allowlist)
+- [ ] Row-level authorization on every query: `WHERE account_id IN (user's accounts)` —
+      write one dependency that enforces it and never hand-roll the filter
+- [ ] Screenshots served via signed, expiring URLs, never public bucket paths
+- [ ] Account deletion actually deletes: raw deals, images, and backups-on-next-rotation
 
-- `/api/v1/health` — shallow, for Caddy and uptime checks.
-- `/api/v1/health/detailed` — per-component `ONLINE | WARNING | OFFLINE`.
-- `/api/v1/health/metrics` — Prometheus; Grafana dashboard JSON in `infra/grafana/`.
+## 7. Compliance — read this before you take one rupee
 
-Metrics worth a panel: `trade_events_received_total`, `event_ingest_latency_seconds`,
-`outbox_pending`, `telegram_publish_latency_seconds`, `telegram_failures_total`,
-`copy_orders_total{status}`, `copy_execution_latency_seconds`, `ea_last_seen_seconds`,
-`dead_letter_depth`.
+A journal is a **record-keeping and analytics tool**, and that is a materially safer
+position than a signal service. Keep it that way:
 
-**Alert on only these five** (more and you will start ignoring them):
+- **Do not tell users what to trade.** The moment the product says "you should buy
+  EURUSD," you are arguably in regulated investment-advice territory in most
+  jurisdictions. Analytics about *their own past behaviour* is not advice.
+- **Do not add copy-trading.** Regulators (the FCA explicitly) treat copy trading, where
+  one person's actions become another's orders without intervention, as portfolio
+  management — a licensed activity. In the US, directing others' futures trades generally
+  requires CTA registration with the CFTC, with serious penalties for operating
+  unregistered. This is a bright line: journal on one side, licensed business on the other.
+- **Do not display or share other users' performance publicly by default.** Leaderboards
+  turn a journal into a de-facto signal marketing platform.
+- **Ship the boring documents:** Terms of Service, Privacy Policy, Risk Disclaimer
+  ("past performance is not indicative of future results"; "this tool provides analytics
+  on your own trading history and does not constitute investment advice").
+- **Data protection.** You hold trading history and broker credentials. Have a written
+  retention policy, an export button, and a delete button. If any member is in the EU or
+  UK, GDPR applies regardless of where you are.
+- **This is a checklist, not legal advice.** Before charging money, spend one hour with a
+  lawyer in your jurisdiction. It is the cheapest line item in the whole project.
 
-1. Master EA heartbeat older than 120 s during market hours
-2. `outbox_pending > 100` for 5 minutes (the relay is stuck)
-3. Any `dead_letter_events` row created
-4. Copy order failure rate > 20% over 15 minutes
-5. `/health` failing for 2 minutes
+## 8. Runbook stubs to write on day one
 
----
-
-## 9. Runbooks to write on day one
-
-`RUNBOOK-restore.md` · `RUNBOOK-ea-offline.md` · `RUNBOOK-telegram-dlq.md` ·
-`RUNBOOK-emergency-stop.md` (including how to *clear* it safely) ·
-`RUNBOOK-secret-rotation.md` · `RUNBOOK-go-live.md`
+- `RUNBOOK-sync-stuck.md` — user says "my trades aren't showing"
+- `RUNBOOK-rebuild.md` — how to re-run reconstruction safely, and how to read the diff
+- `RUNBOOK-mt5-build-update.md` — canary account, what to check
+- `RUNBOOK-restore.md` — the tested restore procedure, with the last test date at the top

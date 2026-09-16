@@ -7,12 +7,12 @@
 //+------------------------------------------------------------------+
 #property strict
 
-#include <TradeBridge/Crypto.mqh>
+#include <Journal/Crypto.mqh>
 
-#define TB_ERR_URL_NOT_ALLOWED 4060
+#define J_ERR_URL_NOT_ALLOWED 4060
 
 //+------------------------------------------------------------------+
-class CTradeBridgeClient
+class CJournalClient
 {
 private:
    string m_baseUrl;
@@ -23,7 +23,7 @@ private:
    string m_lastError;
 
 public:
-   CTradeBridgeClient(): m_timeoutMs(10000), m_lastStatus(0) {}
+   CJournalClient(): m_timeoutMs(10000), m_lastStatus(0) {}
 
    void Configure(const string baseUrl, const string apiKeyId, const string apiSecret)
    {
@@ -66,8 +66,8 @@ private:
       }
 
       string timestamp = IntegerToString((long)TimeGMT());
-      string nonce     = TB_Nonce();
-      string signature = TB_SignRequest(m_apiSecret, timestamp, nonce, body);
+      string nonce     = J_Nonce();
+      string signature = J_SignRequest(m_apiSecret, timestamp, nonce, body);
 
       string headers =
          "Content-Type: application/json\r\n" +
@@ -102,10 +102,10 @@ private:
       if(m_lastStatus == -1)
       {
          int code = GetLastError();
-         if(code == TB_ERR_URL_NOT_ALLOWED)
+         if(code == J_ERR_URL_NOT_ALLOWED)
          {
             m_lastError = "URL not whitelisted";
-            Print("TradeBridge FATAL: add ", m_baseUrl,
+            Print("Journal FATAL: add ", m_baseUrl,
                   " under Tools > Options > Expert Advisors > "
                   "'Allow WebRequest for listed URL', then restart the EA.");
          }
@@ -134,14 +134,14 @@ private:
 //| Append-only disk spool: survives terminal restarts and network    |
 //| outages. Bounded so a long outage cannot fill the disk.           |
 //+------------------------------------------------------------------+
-class CTradeBridgeSpool
+class CJournalSpool
 {
 private:
    string m_filename;
    int    m_maxLines;
 
 public:
-   CTradeBridgeSpool(): m_maxLines(10000) {}
+   CJournalSpool(): m_maxLines(10000) {}
 
    void Configure(const string filename, const int maxLines = 10000)
    {
@@ -190,7 +190,7 @@ public:
 //+------------------------------------------------------------------+
 //| Exponential backoff: 1, 2, 4, 8, 16, capped at 30 seconds.        |
 //+------------------------------------------------------------------+
-int TB_BackoffSeconds(const int consecutiveFailures)
+int J_BackoffSeconds(const int consecutiveFailures)
 {
    if(consecutiveFailures <= 0) return 0;
    int delay = (int)MathPow(2, MathMin(consecutiveFailures - 1, 5));
