@@ -32,6 +32,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -100,7 +101,19 @@ class Account(Base):
 
     __tablename__ = "accounts"
     __table_args__ = (
-        UniqueConstraint("user_id", "mt5_login", "broker_server", name="uq_account_login"),
+        # Partial on purpose. An account that has been created but not yet connected
+        # sits at login 0 / server 'pending', and a plain unique constraint would let
+        # a trader hold only one of those at a time -- so abandoning the connect
+        # dialog once would block them from ever adding another account. A
+        # placeholder is not a broker account; only real ones must be unique.
+        Index(
+            "uq_account_login",
+            "user_id",
+            "mt5_login",
+            "broker_server",
+            unique=True,
+            postgresql_where=text("mt5_login > 0"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)

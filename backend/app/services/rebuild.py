@@ -20,6 +20,7 @@ from app.domain.reconstruct import (
     RECONSTRUCTION_VERSION,
     DealFact,
     ReconstructedTrade,
+    detect_margin_mode,
     reconstruct,
 )
 from app.models import Account, RawDeal, SyncRun, Trade, TradeLeg, User
@@ -127,6 +128,20 @@ async def rebuild_account(
     )
 
     facts = [_to_fact(row) for row in rows]
+
+    # The account itself knows whether it hedges or nets, so never ask its owner.
+    # Only conclusive evidence overrides what is stored -- and when the history shows
+    # none, the two algorithms group these deals identically anyway.
+    detected = detect_margin_mode(facts)
+    if detected is not None and detected != account.margin_mode:
+        log.info(
+            "rebuild.margin_mode_corrected",
+            account_id=str(account.id),
+            was=account.margin_mode,
+            now=detected,
+        )
+        account.margin_mode = detected
+
     rebuilt = reconstruct(facts, account.margin_mode)
     user = await db.get(User, account.user_id)
 

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
+from itertools import pairwise
 
 ZERO = Decimal("0")
 
@@ -394,6 +395,55 @@ def reconstruct(deals: list[DealFact], margin_mode: str) -> list[ReconstructedTr
     if margin_mode == "netting":
         return reconstruct_netting(deals)
     return reconstruct_hedging(deals)
+
+
+def detect_margin_mode(deals: list[DealFact]) -> str | None:
+    """Work out from the history whether this account hedges or nets.
+
+    Nobody should have to answer this question about their own broker, and a trader
+    who guesses wrong corrupts every statistic on the site without anything looking
+    broken. The deals already know.
+
+    Two things are proof:
+
+      a reversal          a deal that closes one position and opens the opposite one
+                          in a single fill. Only a netting account can produce it.
+      two at once         two positions open on the same symbol at the same time.
+                          Only a hedging account can hold them.
+
+    Returns None when the history shows neither, which is the ordinary case and does
+    not matter: with no reversals and no overlaps the two algorithms group the deals
+    identically, so either answer reconstructs the same trades. `test_reconstruct`
+    holds that claim to account.
+    """
+    spans: dict[int, tuple[str, int, int]] = {}
+
+    for deal in deals:
+        if deal.type in NON_TRADE_TYPES:
+            continue
+        if deal.entry == DealEntry.INOUT:
+            return "netting"
+        if deal.position_id is None:
+            continue
+        symbol, start, end = spans.get(
+            deal.position_id, (deal.symbol, deal.time_msc, deal.time_msc)
+        )
+        spans[deal.position_id] = (symbol, min(start, deal.time_msc), max(end, deal.time_msc))
+
+    by_symbol: dict[str, list[tuple[int, int]]] = {}
+    for symbol, start, end in spans.values():
+        by_symbol.setdefault(symbol, []).append((start, end))
+
+    for windows in by_symbol.values():
+        windows.sort()
+        for (_, first_end), (second_start, _) in pairwise(windows):
+            # Strict: two positions that merely touch -- one closing as the next opens
+            # -- are not proof of anything, and being wrong here is worse than being
+            # silent.
+            if second_start < first_end:
+                return "hedging"
+
+    return None
 
 
 def balance_movements(deals: list[DealFact]) -> list[DealFact]:

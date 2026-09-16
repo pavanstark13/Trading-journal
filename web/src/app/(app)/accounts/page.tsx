@@ -382,14 +382,12 @@ function ConnectDialog({
   const [login, setLogin] = React.useState("");
   const [server, setServer] = React.useState("");
   const [password, setPassword] = React.useState("");
-  const [marginMode, setMarginMode] = React.useState<"hedging" | "netting">("hedging");
 
   React.useEffect(() => {
     if (!account) return;
     setLogin(account.mt5_login ? String(account.mt5_login) : "");
     setServer(account.broker_server === "pending" ? "" : account.broker_server);
     setPassword("");
-    setMarginMode(account.margin_mode);
   }, [account]);
 
   const connect = useMutation({
@@ -398,7 +396,6 @@ function ConnectDialog({
         mt5_login: Number(login),
         broker_server: server.trim(),
         investor_password: password,
-        margin_mode: marginMode,
       }),
     onSuccess: async () => {
       // Kick the first import straight away rather than making them wait for the
@@ -469,24 +466,17 @@ function ConnectDialog({
         />
       </Field>
 
-      <Field
-        label="Account type"
-        hint="If you can hold a buy and a sell on the same pair at once, it is hedging."
-      >
-        <Select
-          value={marginMode}
-          onChange={(event) => setMarginMode(event.target.value as "hedging" | "netting")}
-        >
-          <option value="hedging">Hedging (most forex brokers)</option>
-          <option value="netting">Netting</option>
-        </Select>
-      </Field>
-
       <p className="flex items-start gap-2 rounded-md border border-line px-3 py-2 text-xs text-fg-muted">
         <Lock className="mt-0.5 h-3 w-3 shrink-0" />
         The investor password is read-only: your broker&apos;s own server refuses every
         trading action made with it. We pass it straight to the service that reads your
         history and never store it here.
+      </p>
+
+      <p className="text-2xs text-fg-subtle">
+        Everything else — whether your broker hedges or nets, which instruments you
+        trade, what your balance is — is read from your history. You are not asked
+        anything you would have to look up.
       </p>
 
       {connect.error ? <ErrorNote error={connect.error} /> : null}

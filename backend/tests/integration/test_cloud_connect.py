@@ -317,6 +317,76 @@ async def test_the_poller_only_reads_accounts_that_are_due(db, client, trader) -
     assert await provider_sync.due_accounts(db) == []
 
 
+@respx.mock
+async def test_the_account_type_is_worked_out_not_asked(db, client, trader) -> None:
+    """A trader should not have to know whether their broker hedges or nets.
+
+    Getting it wrong corrupts every statistic while nothing looks broken, so the
+    history decides: here two EURUSD positions are open at the same time, which only
+    a hedging account can do.
+    """
+    headers = auth(trader)
+    overlapping = [
+        *_history(),
+        {
+            "id": "6", "orderId": "24", "positionId": "24", "type": "DEAL_TYPE_BUY",
+            "entryType": "DEAL_ENTRY_IN", "time": "2026-03-04T08:00:00.000Z",
+            "symbol": "EURUSD", "volume": 1.0, "price": 1.08000,
+        },
+        {
+            "id": "7", "orderId": "25", "positionId": "25", "type": "DEAL_TYPE_SELL",
+            "entryType": "DEAL_ENTRY_IN", "time": "2026-03-04T08:30:00.000Z",
+            "symbol": "EURUSD", "volume": 1.0, "price": 1.08100,
+        },
+        {
+            "id": "8", "orderId": "26", "positionId": "24", "type": "DEAL_TYPE_SELL",
+            "entryType": "DEAL_ENTRY_OUT", "time": "2026-03-04T10:00:00.000Z",
+            "symbol": "EURUSD", "volume": 1.0, "price": 1.08300, "profit": 300,
+        },
+        {
+            "id": "9", "orderId": "27", "positionId": "25", "type": "DEAL_TYPE_BUY",
+            "entryType": "DEAL_ENTRY_OUT", "time": "2026-03-04T11:00:00.000Z",
+            "symbol": "EURUSD", "volume": 1.0, "price": 1.08400, "profit": -300,
+        },
+    ]
+    respx.get(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    respx.post(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(201, json={"id": "acc-1"})
+    )
+    respx.get(url__startswith=f"{CLIENT}/users/current/accounts/acc-1/history-deals").mock(
+        return_value=httpx.Response(200, json=overlapping)
+    )
+
+    created = await client.post(
+        "/api/v1/accounts", headers=headers,
+        json={"label": "MEX Atlantic", "sync_source": "cloud"},
+    )
+    account_id = created.json()["id"]
+
+    # Deliberately connected as netting -- the wrong answer, as a trader who guessed
+    # would give.
+    await client.post(
+        f"/api/v1/accounts/{account_id}/connect",
+        headers=headers,
+        json={"mt5_login": 123456, "broker_server": "MEXAtlantic-Real",
+              "investor_password": INVESTOR_PASSWORD, "margin_mode": "netting"},
+    )
+    synced = await client.post(f"/api/v1/accounts/{account_id}/sync", headers=headers)
+    assert synced.status_code == 200
+
+    account = await db.get(Account, account_id)
+    await db.refresh(account)
+    assert account.margin_mode == "hedging"
+
+    # The two simultaneous positions are two trades, not one netted-out nothing.
+    trades = (await db.execute(select(Trade))).scalars().all()
+    assert len(trades) == 4
+    same_day = [t for t in trades if t.symbol == "EURUSD" and t.opened_at.day == 4]
+    assert {t.direction for t in same_day} == {"long", "short"}
+
+
 async def test_the_scheduler_endpoint_is_closed_without_a_secret(client, monkeypatch) -> None:
     """A scheduler endpoint anyone can call is a free way to drive our database."""
     monkeypatch.setattr(settings, "cron_secret", "")
@@ -331,3 +401,58 @@ async def test_the_scheduler_endpoint_is_closed_without_a_secret(client, monkeyp
     ok = await client.get("/api/v1/cron/tick", headers={"Authorization": "Bearer s3cret"})
     assert ok.status_code == 200
     assert ok.json()["polled"]["considered"] == 0
+
+
+async def test_two_accounts_can_wait_to_be_connected(client, trader) -> None:
+    """A placeholder is not a broker account.
+
+    Abandoning the connect dialog once used to leave a row at login 0 / server
+    'pending' that blocked every later account with a unique violation -- a 500 with
+    a stack trace, for doing nothing wrong.
+    """
+    headers = auth(trader)
+    for label in ("MEX Atlantic", "A second account", "A third"):
+        response = await client.post(
+            "/api/v1/accounts", headers=headers,
+            json={"label": label, "sync_source": "cloud"},
+        )
+        assert response.status_code == 201, response.text
+
+    listing = await client.get("/api/v1/accounts", headers=headers)
+    assert len(listing.json()) == 3
+
+
+@respx.mock
+async def test_adding_the_same_broker_account_twice_is_refused_in_words(
+    client, trader
+) -> None:
+    headers = auth(trader)
+    respx.get(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    respx.post(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(201, json={"id": "acc-1"})
+    )
+
+    details = {
+        "mt5_login": 123456,
+        "broker_server": "MEXAtlantic-Real",
+        "investor_password": INVESTOR_PASSWORD,
+    }
+    ids = []
+    for label in ("First", "Second"):
+        created = await client.post(
+            "/api/v1/accounts", headers=headers,
+            json={"label": label, "sync_source": "cloud"},
+        )
+        ids.append(created.json()["id"])
+
+    assert (
+        await client.post(f"/api/v1/accounts/{ids[0]}/connect", headers=headers, json=details)
+    ).status_code == 200
+
+    clash = await client.post(
+        f"/api/v1/accounts/{ids[1]}/connect", headers=headers, json=details
+    )
+    assert clash.status_code == 409
+    assert "already added" in clash.json()["detail"]

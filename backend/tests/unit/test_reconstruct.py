@@ -11,6 +11,7 @@ from decimal import Decimal
 from app.domain.reconstruct import (
     DealFact,
     balance_movements,
+    detect_margin_mode,
     reconstruct,
     reconstruct_hedging,
     reconstruct_netting,
@@ -360,3 +361,95 @@ def test_trade_key_is_stable_across_runs() -> None:
     first = reconstruct(deals, "hedging")[0].trade_key
     second = reconstruct(deals, "hedging")[0].trade_key
     assert first == second == "h:4242"
+
+
+# ── working out the account type instead of asking ──────────────────────────────
+HOUR = 3_600_000
+
+
+def test_a_reversal_proves_the_account_nets() -> None:
+    """Only a netting account can close one position and open the opposite in one fill."""
+    deals = [
+        deal(1, kind="buy", entry="in", offset_ms=0),
+        deal(2, kind="sell", entry="inout", volume="0.20", offset_ms=HOUR),
+        deal(3, kind="buy", entry="out", volume="0.10", offset_ms=2 * HOUR),
+    ]
+    assert detect_margin_mode(deals) == "netting"
+
+
+def test_two_positions_at_once_on_one_symbol_prove_the_account_hedges() -> None:
+    deals = [
+        deal(1, position_id=1, entry="in", offset_ms=0),
+        deal(2, position_id=2, entry="in", offset_ms=HOUR),
+        deal(3, position_id=1, kind="sell", entry="out", offset_ms=2 * HOUR),
+        deal(4, position_id=2, kind="sell", entry="out", offset_ms=3 * HOUR),
+    ]
+    assert detect_margin_mode(deals) == "hedging"
+
+
+def test_positions_that_merely_touch_prove_nothing() -> None:
+    """One closing as the next opens happens on either kind of account."""
+    deals = [
+        deal(1, position_id=1, entry="in", offset_ms=0),
+        deal(2, position_id=1, kind="sell", entry="out", offset_ms=HOUR),
+        deal(3, position_id=2, entry="in", offset_ms=HOUR),
+        deal(4, position_id=2, kind="sell", entry="out", offset_ms=2 * HOUR),
+    ]
+    assert detect_margin_mode(deals) is None
+
+
+def test_positions_on_different_symbols_prove_nothing() -> None:
+    """Every account can hold EURUSD and gold at the same time."""
+    deals = [
+        deal(1, position_id=1, symbol="EURUSD", entry="in", offset_ms=0),
+        deal(2, position_id=2, symbol="XAUUSD", entry="in", offset_ms=HOUR),
+        deal(3, position_id=1, symbol="EURUSD", kind="sell", entry="out", offset_ms=3 * HOUR),
+        deal(4, position_id=2, symbol="XAUUSD", kind="sell", entry="out", offset_ms=4 * HOUR),
+    ]
+    assert detect_margin_mode(deals) is None
+
+
+def test_deposits_are_not_evidence_of_anything() -> None:
+    deals = [
+        deal(1, kind="balance", entry="in", position_id=None, profit="10000", offset_ms=0),
+        deal(2, position_id=1, entry="in", offset_ms=HOUR),
+        deal(3, position_id=1, kind="sell", entry="out", offset_ms=2 * HOUR),
+    ]
+    assert detect_margin_mode(deals) is None
+
+
+def test_when_the_history_cannot_tell_the_answer_does_not_matter() -> None:
+    """The claim `detect_margin_mode` relies on, held to account.
+
+    With no reversal and no overlap, hedging and netting group the deals identically
+    -- so leaving the mode at its default cannot corrupt anything. This is what makes
+    it honest to stop asking the trader a question they cannot answer.
+    """
+    deals = [
+        deal(1, kind="balance", entry="in", position_id=None, profit="10000", offset_ms=0),
+        # a scale-in, a partial exit, then the rest
+        deal(2, position_id=1, entry="in", volume="0.10", price="1.10000", offset_ms=HOUR),
+        deal(3, position_id=1, entry="in", volume="0.20", price="1.10200", offset_ms=2 * HOUR),
+        deal(4, position_id=1, kind="sell", entry="out", volume="0.15", price="1.10500",
+             profit="40", offset_ms=3 * HOUR),
+        deal(5, position_id=1, kind="sell", entry="out", volume="0.15", price="1.10800",
+             profit="70", commission="-4", swap="-1", offset_ms=4 * HOUR),
+        # a separate, later trade on another symbol
+        deal(6, position_id=2, symbol="XAUUSD", kind="sell", entry="in", volume="0.50",
+             price="2340.00", digits=2, offset_ms=5 * HOUR),
+        deal(7, position_id=2, symbol="XAUUSD", kind="buy", entry="out", volume="0.50",
+             price="2330.00", profit="500", digits=2, offset_ms=6 * HOUR),
+    ]
+    assert detect_margin_mode(deals) is None
+
+    as_hedging = reconstruct_hedging(deals)
+    as_netting = reconstruct_netting(deals)
+
+    def shape(trades: list) -> list[tuple]:
+        return [
+            (t.symbol, t.direction, t.status, t.volume_opened, t.volume_closed,
+             t.avg_entry_price, t.avg_exit_price, t.net_profit, t.opened_at, t.closed_at)
+            for t in sorted(trades, key=lambda t: (t.opened_at, t.symbol))
+        ]
+
+    assert shape(as_hedging) == shape(as_netting)
