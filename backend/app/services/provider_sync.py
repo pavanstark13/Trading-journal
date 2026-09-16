@@ -41,6 +41,15 @@ class ProviderSyncError(Exception):
     """Something the trader or an operator has to fix. Message is shown to them."""
 
 
+def _seen_keys(raw_deals: list[dict], sample: int = 20) -> set[str]:
+    """Field names the provider actually sent. Keys only -- never the values."""
+    keys: set[str] = set()
+    for item in raw_deals[:sample]:
+        if isinstance(item, dict):
+            keys.update(str(k) for k in item)
+    return keys
+
+
 def _handle(account: Account) -> ProviderHandle:
     if not account.provider or not account.provider_account_id:
         raise ProviderSyncError("This account is not connected to a cloud terminal.")
@@ -160,6 +169,19 @@ async def sync_account(db: AsyncSession, account: Account, *, full: bool = False
         payloads = [p for p in (provider.to_deal_payload(d) for d in raw_deals) if p]
         unreadable = len(raw_deals) - len(payloads)
 
+        if raw_deals and not payloads:
+            # Every record came back unreadable. That is not an empty history -- it
+            # means the provider's field names are not what this adapter expects, and
+            # reporting it as a clean sync would show the trader "synced, 0 trades"
+            # while their entire history sat there unread. Name it, and hand over the
+            # field names we actually got so it can be fixed in one pass.
+            raise ProviderSyncError(
+                f"Read {len(raw_deals)} records from the provider and could not "
+                "interpret any of them, so nothing was imported. This is a fault in "
+                "the journal, not in your account. Fields received: "
+                + ", ".join(sorted(_seen_keys(raw_deals)))
+            )
+
         accepted = 0
         duplicates = 0
         for chunk in (
@@ -187,6 +209,14 @@ async def sync_account(db: AsyncSession, account: Account, *, full: bool = False
         run.deals_seen = len(raw_deals)
         run.deals_new = accepted
         run.finished_at = datetime.now(UTC)
+        if unreadable:
+            # Partial: the import is real but incomplete, and a statistic computed
+            # from a history with holes in it is worse than one that admits the gap.
+            run.error = f"{unreadable} of {len(raw_deals)} records could not be read"
+            account.sync_error = (
+                f"{unreadable} broker records could not be read and are missing from "
+                "your trades. Everything else imported normally."
+            )
         await db.commit()
 
         if unreadable:

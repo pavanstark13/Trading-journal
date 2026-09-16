@@ -456,3 +456,93 @@ async def test_adding_the_same_broker_account_twice_is_refused_in_words(
     )
     assert clash.status_code == 409
     assert "already added" in clash.json()["detail"]
+
+
+@respx.mock
+async def test_a_history_we_cannot_read_is_never_reported_as_a_clean_sync(
+    db, client, trader
+) -> None:
+    """The likeliest first-connection failure, and it used to be invisible.
+
+    If the provider's field names are not what the adapter expects, every record maps
+    to nothing. `deals_seen: 812, deals_new: 0` then reads exactly like "no new
+    trades" while the trader's whole history sits there unread.
+    """
+    headers = auth(trader)
+    respx.get(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    respx.post(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(201, json={"id": "acc-1"})
+    )
+    # Plausible records in a shape this adapter does not know.
+    respx.get(url__startswith=f"{CLIENT}/users/current/accounts/acc-1/history-deals").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"dealId": "1", "dealType": "BUY", "openTime": "2026-03-02T08:00:00Z"},
+                {"dealId": "2", "dealType": "SELL", "openTime": "2026-03-02T09:00:00Z"},
+            ],
+        )
+    )
+
+    created = await client.post(
+        "/api/v1/accounts", headers=headers,
+        json={"label": "MEX Atlantic", "sync_source": "cloud"},
+    )
+    account_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/accounts/{account_id}/connect",
+        headers=headers,
+        json={"mt5_login": 123456, "broker_server": "MEXAtlantic-Real",
+              "investor_password": INVESTOR_PASSWORD},
+    )
+
+    response = await client.post(f"/api/v1/accounts/{account_id}/sync", headers=headers)
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "could not interpret any of them" in detail
+    # The field names we actually received, so it is one pass to fix and not a hunt.
+    assert "dealId" in detail and "dealType" in detail
+    assert "fault in the journal, not in your account" in detail
+
+    account = await db.get(Account, account_id)
+    await db.refresh(account)
+    assert account.sync_status == "ERROR"
+
+
+@respx.mock
+async def test_a_partly_readable_history_admits_the_gap(db, client, trader) -> None:
+    """A statistic from a history with holes is worse than one that owns up."""
+    headers = auth(trader)
+    respx.get(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    respx.post(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(201, json={"id": "acc-1"})
+    )
+    respx.get(url__startswith=f"{CLIENT}/users/current/accounts/acc-1/history-deals").mock(
+        return_value=httpx.Response(
+            200, json=[*_history(), {"id": "99", "type": "DEAL_TYPE_FUTURE_THING"}]
+        )
+    )
+
+    created = await client.post(
+        "/api/v1/accounts", headers=headers,
+        json={"label": "MEX Atlantic", "sync_source": "cloud"},
+    )
+    account_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/accounts/{account_id}/connect",
+        headers=headers,
+        json={"mt5_login": 123456, "broker_server": "MEXAtlantic-Real",
+              "investor_password": INVESTOR_PASSWORD},
+    )
+
+    result = (await client.post(f"/api/v1/accounts/{account_id}/sync", headers=headers)).json()
+    assert result["unreadable"] == 1
+    assert result["deals_new"] == 5
+
+    account = await db.get(Account, account_id)
+    await db.refresh(account)
+    assert "1 broker records could not be read" in (account.sync_error or "")
