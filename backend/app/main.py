@@ -5,7 +5,6 @@ import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-import sentry_sdk
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -34,12 +33,20 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging(settings.log_level, json_output=settings.is_production)
     settings.assert_production_safe()
     if settings.sentry_dsn:
-        sentry_sdk.init(
-            dsn=settings.sentry_dsn,
-            environment=settings.env,
-            before_send=sentry_before_send,
-            traces_sample_rate=0.1,
-        )
+        # Imported here, not at module scope. Error reporting is optional and off by
+        # default, and a serverless cold start should not pay to import a package
+        # that will never be used -- nor crash outright when it is not installed.
+        try:
+            import sentry_sdk
+
+            sentry_sdk.init(
+                dsn=settings.sentry_dsn,
+                environment=settings.env,
+                before_send=sentry_before_send,
+                traces_sample_rate=0.1,
+            )
+        except ImportError:
+            log.warning("sentry.not_installed", hint="pip install 'sentry-sdk[fastapi]'")
     log.info("app.startup", env=settings.env)
     yield
     await close_redis()
