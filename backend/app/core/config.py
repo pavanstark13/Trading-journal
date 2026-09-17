@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     #: Re-read this far back every poll. Brokers book swap and commission late, so a
     #: closed trade's true cost keeps moving for days after the fill.
     provider_overlap_hours: int = 48
+    #: How long one sync may spend reading before it saves its place and returns.
+    #: Must stay under the platform's function timeout -- Vercel's own FastAPI
+    #: example uses 60 seconds, so this leaves room to finish the database work.
+    provider_sync_budget_sec: float = 40.0
     #: How far back the first import reaches. Ten years covers any real account.
     provider_backfill_years: int = 10
 

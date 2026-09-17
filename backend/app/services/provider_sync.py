@@ -18,6 +18,7 @@ produce byte-identical trades.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +36,9 @@ log = get_logger(__name__)
 SOURCE = "cloud"
 #: DealBatch caps a batch at 500; a ten-year backfill is many times that.
 BATCH_SIZE = 500
+#: How much history one request to the provider asks for. Small enough that a slice
+#: comfortably fits a serverless invocation, large enough not to be chatty.
+CHUNK_DAYS = 180
 
 
 class ProviderSyncError(Exception):
@@ -136,25 +140,53 @@ async def disconnect(db: AsyncSession, account: Account) -> None:
     await db.commit()
 
 
-def _window(account: Account, *, full: bool) -> tuple[datetime, datetime]:
-    """How far back to read.
+def _msc(moment: datetime) -> int:
+    return int(moment.timestamp() * 1000)
 
-    Every poll re-reads an overlap window because brokers book swap and commission
-    late -- a trade closed on Friday can still change on Monday. Re-reading is free:
-    the unique index on (account, deal ticket) drops what we already hold.
+
+def _window(account: Account, *, full: bool) -> tuple[datetime, datetime, bool]:
+    """How far back to read, where a resumed import picks up, and which mode it is.
+
+    Three cases, and the third is the only expensive one:
+
+      resuming    an import already in progress. Its cursor is the only thing that
+                  knows how far a part-finished read actually got.
+      importing   nothing held yet, so reach back far enough to cover any account.
+      catching up we hold history already: read from the last deal, less an overlap
+                  window, because brokers book swap and commission late -- a trade
+                  closed on Friday can still change on Monday. Re-reading is free:
+                  the unique index on (account, deal ticket) drops what we hold.
+
+    The flag says whether this is an import. Only an import is worth splitting into
+    slices; catching up is one request however long the span, because a quiet account
+    returns almost nothing and chunking it would multiply every poll by the months
+    since the trader last traded.
     """
     end = datetime.now(UTC) + timedelta(minutes=5)     # tolerate broker clock skew
+
+    if account.provider_backfill_cursor_msc is not None and not full:
+        resume = datetime.fromtimestamp(
+            account.provider_backfill_cursor_msc / 1000, tz=UTC
+        )
+        return resume, end, True
+
     if full or account.last_deal_time_msc is None:
-        return end - timedelta(days=365 * settings.provider_backfill_years), end
+        return end - timedelta(days=365 * settings.provider_backfill_years), end, True
 
     last = datetime.fromtimestamp(account.last_deal_time_msc / 1000, tz=UTC)
-    return last - timedelta(hours=settings.provider_overlap_hours), end
+    return last - timedelta(hours=settings.provider_overlap_hours), end, False
 
 
-async def sync_account(db: AsyncSession, account: Account, *, full: bool = False) -> dict:
+async def sync_account(
+    db: AsyncSession,
+    account: Account,
+    *,
+    full: bool = False,
+    budget_seconds: float | None = None,
+) -> dict:
     """Pull new deals for one connected account. Safe to run as often as you like."""
     handle = _handle(account)
-    start, end = _window(account, full=full)
+    start, end, importing = _window(account, full=full)
 
     run = SyncRun(account_id=account.id, source=SOURCE, status="RUNNING")
     db.add(run)
@@ -164,8 +196,31 @@ async def sync_account(db: AsyncSession, account: Account, *, full: bool = False
     run_id, account_id = run.id, account.id
 
     provider = get_provider(account.provider or "metaapi")
+    deadline = monotonic() + (
+        budget_seconds if budget_seconds is not None else settings.provider_sync_budget_sec
+    )
     try:
-        raw_deals = await provider.fetch_deals(handle, start, end)
+        # Read in slices rather than one request. A long history does not fit in a
+        # serverless invocation's time limit, and a timeout part way through a single
+        # giant read imports nothing at all -- the worst outcome, because it looks
+        # like the account simply does not work.
+        raw_deals: list[dict] = []
+        cursor = start
+        caught_up = True
+        if not importing:
+            raw_deals = await provider.fetch_deals(handle, start, end)
+            cursor = end
+        else:
+            while cursor < end:
+                slice_end = min(cursor + timedelta(days=CHUNK_DAYS), end)
+                raw_deals.extend(await provider.fetch_deals(handle, cursor, slice_end))
+                cursor = slice_end
+                if cursor < end and monotonic() >= deadline:
+                    # Out of time. What has been read is kept, and the cursor below
+                    # means the next run continues from here, not from the beginning.
+                    caught_up = False
+                    break
+
         payloads = [p for p in (provider.to_deal_payload(d) for d in raw_deals) if p]
         unreadable = len(raw_deals) - len(payloads)
 
@@ -197,12 +252,14 @@ async def sync_account(db: AsyncSession, account: Account, *, full: bool = False
         # floating P/L of open positions, which history does not contain, and a
         # wrong equity figure is worse than an empty one.
         account.balance = await rebuild.ledger_balance(db, account.id)
+        # None means caught up. A time is where the next run resumes from.
+        account.provider_backfill_cursor_msc = None if caught_up else _msc(cursor)
         account.provider_state = "DEPLOYED"
         account.provider_synced_at = datetime.now(UTC)
         # A successful read is this account's heartbeat: there is no terminal of the
         # trader's own to hear from.
         account.last_heartbeat_at = datetime.now(UTC)
-        account.sync_status = "SYNCED"
+        account.sync_status = "SYNCED" if caught_up else "IMPORTING"
         account.sync_error = None
 
         run.status = "OK"
@@ -238,6 +295,10 @@ async def sync_account(db: AsyncSession, account: Account, *, full: bool = False
             "deals_new": accepted,
             "duplicates": duplicates,
             "unreadable": unreadable,
+            #: False while a first import is still working through the history. The
+            #: next poll carries on; nothing is lost and nothing is re-read.
+            "caught_up": caught_up,
+            "resumes_from": None if caught_up else cursor.isoformat(),
         }
     except Exception as exc:
         await db.rollback()

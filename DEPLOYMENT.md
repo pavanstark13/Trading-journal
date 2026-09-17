@@ -110,6 +110,13 @@ Migrations do not run themselves here — there is no entrypoint to hang them of
 Run `alembic upgrade head` against the **direct** (not pooled) connection string
 before promoting a deployment.
 
+**Long histories.** A first import can be years of deals, which does not fit in one
+function invocation on any plan. It is read in slices and saves its place, so a run
+that runs out of time is resumed by the next one rather than starting over -- the
+account simply shows `IMPORTING` until it catches up. `maxDuration` is therefore 60
+seconds, which is safe on every plan, rather than a large number the plan might
+refuse.
+
 **The honest trade-off.** Vercel costs more per month than the €13 VPS above and
 polls on a schedule rather than reacting in seconds. What it buys is that nobody has
 to patch, monitor or restart a server. For one trader and a handful of friends, that

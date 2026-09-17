@@ -9,6 +9,7 @@ statistics -- is the same code the EA path runs, and is exercised for real.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import httpx
@@ -22,6 +23,7 @@ from app.core.db import get_session
 from app.core.security import Role, create_access_token
 from app.main import create_app
 from app.models import Account, AuditLog, Trade, User
+from app.services import provider_sync
 
 PROVISIONING = "https://prov.test"
 CLIENT = "https://client.test"
@@ -102,6 +104,27 @@ def _history() -> list[dict]:
     ]
 
 
+def _windowed(deals: list[dict]):
+    """A stand-in that answers like the real API: only deals inside the window asked
+    for. A mock that returns everything regardless makes a chunked read look like it
+    is fetching the same history over and over, and hides real off-by-one errors."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        _, _, span = str(request.url).partition("/history-deals/time/")
+        start_text, _, end_text = span.partition("/")
+        start = datetime.fromisoformat(start_text.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(end_text.replace("Z", "+00:00"))
+        inside = [
+            d for d in deals
+            if start <= datetime.fromisoformat(
+                str(d.get("brokerTime") or d.get("time")).replace("Z", "+00:00")
+            ) < end
+        ]
+        return httpx.Response(200, json=inside)
+
+    return respond
+
+
 @respx.mock
 async def test_a_trader_with_no_windows_machine_still_gets_their_journal(
     db, client, trader
@@ -115,7 +138,7 @@ async def test_a_trader_with_no_windows_machine_still_gets_their_journal(
     )
     history = respx.get(
         url__startswith=f"{CLIENT}/users/current/accounts/acc-1/history-deals"
-    ).mock(return_value=httpx.Response(200, json=_history()))
+    ).mock(side_effect=_windowed(_history()))
 
     created = await client.post(
         "/api/v1/accounts",
@@ -172,7 +195,10 @@ async def test_a_trader_with_no_windows_machine_still_gets_their_journal(
     # ── a second read changes nothing: deals dedupe on the broker's ticket ────
     again = await client.post(f"/api/v1/accounts/{account_id}/sync", headers=headers)
     assert again.json()["deals_new"] == 0
-    assert again.json()["duplicates"] == 5
+    # Four, not five: the first import is done, so this reads only the 48-hour
+    # overlap window back from the last deal. The opening deposit is older than that
+    # and is not re-read -- which is the point of the window.
+    assert again.json()["duplicates"] == 4
     assert (await db.execute(select(Trade))).scalars().all().__len__() == 2
 
     # ── the password is nowhere in our database ───────────────────────────────
@@ -257,7 +283,7 @@ async def test_disconnecting_keeps_the_history(db, client, trader) -> None:
         return_value=httpx.Response(201, json={"id": "acc-1"})
     )
     respx.get(url__startswith=f"{CLIENT}/users/current/accounts/acc-1/history-deals").mock(
-        return_value=httpx.Response(200, json=_history())
+        side_effect=_windowed(_history())
     )
     removal = respx.delete(f"{PROVISIONING}/users/current/accounts/acc-1").mock(
         return_value=httpx.Response(204)
@@ -297,7 +323,7 @@ async def test_the_poller_only_reads_accounts_that_are_due(db, client, trader) -
         return_value=httpx.Response(201, json={"id": "acc-1"})
     )
     respx.get(url__startswith=f"{CLIENT}/users/current/accounts/acc-1/history-deals").mock(
-        return_value=httpx.Response(200, json=_history())
+        side_effect=_windowed(_history())
     )
 
     created = await client.post(
@@ -521,10 +547,11 @@ async def test_a_partly_readable_history_admits_the_gap(db, client, trader) -> N
     respx.post(f"{PROVISIONING}/users/current/accounts").mock(
         return_value=httpx.Response(201, json={"id": "acc-1"})
     )
+    # One record in a shape the adapter does not know, dated inside the history.
+    unreadable = {"id": "99", "type": "DEAL_TYPE_FUTURE_THING",
+                  "time": "2026-03-02T12:00:00.000Z"}
     respx.get(url__startswith=f"{CLIENT}/users/current/accounts/acc-1/history-deals").mock(
-        return_value=httpx.Response(
-            200, json=[*_history(), {"id": "99", "type": "DEAL_TYPE_FUTURE_THING"}]
-        )
+        side_effect=_windowed([*_history(), unreadable])
     )
 
     created = await client.post(
@@ -546,3 +573,103 @@ async def test_a_partly_readable_history_admits_the_gap(db, client, trader) -> N
     account = await db.get(Account, account_id)
     await db.refresh(account)
     assert "1 broker records could not be read" in (account.sync_error or "")
+
+
+@respx.mock
+async def test_a_long_history_is_imported_across_several_runs(db, client, trader) -> None:
+    """A ten-year read does not fit in one serverless invocation.
+
+    Before this, a timeout part way through a single giant request imported nothing
+    at all -- which looks to the trader like the account simply does not work.
+    """
+    headers = auth(trader)
+    respx.get(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    respx.post(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(201, json={"id": "acc-1"})
+    )
+    slices = respx.get(
+        url__startswith=f"{CLIENT}/users/current/accounts/acc-1/history-deals"
+    ).mock(return_value=httpx.Response(200, json=[]))
+
+    created = await client.post(
+        "/api/v1/accounts", headers=headers,
+        json={"label": "MEX Atlantic", "sync_source": "cloud"},
+    )
+    account_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/accounts/{account_id}/connect",
+        headers=headers,
+        json={"mt5_login": 123456, "broker_server": "MEXAtlantic-Real",
+              "investor_password": INVESTOR_PASSWORD},
+    )
+
+    account = await db.get(Account, account_id)
+
+    # A budget of zero: one slice is read, then it saves its place and returns.
+    first = await provider_sync.sync_account(db, account, full=True, budget_seconds=0)
+    assert first["caught_up"] is False
+    assert first["resumes_from"] is not None
+    calls_after_first = len(slices.calls)
+    assert calls_after_first == 1          # one slice, not ten years in one request
+
+    await db.refresh(account)
+    assert account.provider_backfill_cursor_msc is not None
+    assert account.sync_status == "IMPORTING"
+
+    # The next run continues from the cursor rather than starting over.
+    resumed_from = datetime.fromtimestamp(
+        account.provider_backfill_cursor_msc / 1000, tz=UTC
+    )
+    second = await provider_sync.sync_account(db, account, budget_seconds=0)
+    assert second["caught_up"] is False
+    assert len(slices.calls) == calls_after_first + 1
+    asked_for = str(slices.calls[-1].request.url)
+    assert resumed_from.strftime("%Y-%m-%dT%H:%M:%S") in asked_for
+
+    # Given time, it finishes and stops being an import.
+    final = await provider_sync.sync_account(db, account, budget_seconds=300)
+    assert final["caught_up"] is True
+    await db.refresh(account)
+    assert account.provider_backfill_cursor_msc is None
+    assert account.sync_status == "SYNCED"
+
+
+@respx.mock
+async def test_an_ordinary_poll_still_reads_only_the_recent_window(
+    db, client, trader
+) -> None:
+    """Chunking is for the first import; it must not make every poll expensive."""
+    headers = auth(trader)
+    respx.get(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    respx.post(f"{PROVISIONING}/users/current/accounts").mock(
+        return_value=httpx.Response(201, json={"id": "acc-1"})
+    )
+    slices = respx.get(
+        url__startswith=f"{CLIENT}/users/current/accounts/acc-1/history-deals"
+    ).mock(side_effect=_windowed(_history()))
+
+    created = await client.post(
+        "/api/v1/accounts", headers=headers,
+        json={"label": "MEX Atlantic", "sync_source": "cloud"},
+    )
+    account_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/accounts/{account_id}/connect",
+        headers=headers,
+        json={"mt5_login": 123456, "broker_server": "MEXAtlantic-Real",
+              "investor_password": INVESTOR_PASSWORD},
+    )
+    account = await db.get(Account, account_id)
+    await provider_sync.sync_account(db, account, full=True)
+    await db.refresh(account)
+    assert account.provider_backfill_cursor_msc is None
+
+    before = len(slices.calls)
+    result = await provider_sync.sync_account(db, account)
+    assert result["caught_up"] is True
+    # The overlap window is 48 hours: one slice, every time.
+    assert len(slices.calls) == before + 1

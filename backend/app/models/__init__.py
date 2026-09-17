@@ -140,6 +140,10 @@ class Account(Base):
     #: The provider's own connection state, verbatim, e.g. DEPLOYED / DEPLOYING.
     provider_state: Mapped[str | None] = mapped_column(String(24))
     provider_synced_at: Mapped[datetime | None] = mapped_column(TS)
+    #: How far a first import has got. A ten-year history does not fit in one
+    #: serverless invocation, so it is read in chunks and resumed from here.
+    #: NULL means there is no import in progress.
+    provider_backfill_cursor_msc: Mapped[int | None] = mapped_column(BigInteger)
     starting_balance: Mapped[Decimal | None] = mapped_column(Money)
     balance: Mapped[Decimal | None] = mapped_column(Money)
     equity: Mapped[Decimal | None] = mapped_column(Money)
