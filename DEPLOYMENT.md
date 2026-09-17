@@ -86,22 +86,28 @@ statement only exists on one of them. asyncpg prepares every statement by defaul
 `prepared statement "__asyncpg_1__" does not exist` -- intermittent, under load only,
 and impossible to reproduce against a direct connection.
 
-Environment variables, on the API project:
+Environment variables, on the API project. The storage integrations write their own
+connection strings and the application reads them, so **no database URL is typed by
+hand** -- picking the unpooled one by mistake is the classic way to have a deployment
+that tests fine and collapses under load:
 
 ```
-DATABASE_URL=postgresql+asyncpg://…-pooler…/journal
-REDIS_URL=rediss://…upstash.io:6379
-SERVERLESS=true
-ENV=production
-JWT_SECRET=…                 # 32+ random bytes
-MASTER_ENCRYPTION_KEY=…      # 32+ random bytes, never rotated casually
-CRON_SECRET=…                # Vercel sends this as a bearer token
+JWT_SECRET=…                 # a long random string
+MASTER_ENCRYPTION_KEY=…      # a different long random string, never rotated casually
+CRON_SECRET=…                # Vercel sends this back as a bearer token
 METAAPI_TOKEN=…
-FRONTEND_ORIGIN=https://your-domain
-ENABLE_DOCS=false
+FRONTEND_ORIGIN=https://your-site
 ```
 
-and on the web project, `NEXT_PUBLIC_API_BASE_URL=https://api.your-domain`.
+and on the web project, `NEXT_PUBLIC_API_BASE_URL=https://your-api`.
+
+Everything else is inferred. `POSTGRES_URL` and `KV_URL` are read as they are found,
+with the scheme corrected to the async driver, libpq's `sslmode` translated to what
+asyncpg actually accepts, and provider-specific extras such as `channel_binding`
+dropped -- each of which otherwise fails at the first query rather than at startup.
+`VERCEL` turns off this application's own connection pool, and `VERCEL_ENV=production`
+switches on production mode and closes the API docs. A preview deployment stays in
+development mode on purpose, so it keeps its docs and its readable errors.
 
 `CRON_SECRET` is not optional. With it unset the scheduler endpoints return 404
 rather than running: an endpoint anyone can call is a free way to drive the database.
